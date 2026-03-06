@@ -8252,10 +8252,29 @@ public final class ActivityThread extends ClientTransactionHandler
             if (fileName == null) return true;
 
             // 用户可操作路径判断
+            // dalvik.system.PathClassLoader[
+            //     DexPathList[
+            //         [
+            //             zip file "/data/app/~~tIm1tO5Ipzl4bGAKKLmzEQ==/com.asmzhang.testapp-Oe27OKKjcqmG8cwK--mosQ==/base.apk",
+            //             zip file "/data/user/0/com.asmzhang.testapp/code_cache/i11111i111.zip"
+            //         ],
+            //     nativeLibraryDirectories=
+            //     [
+            //         /data/app/~~tIm1tO5Ipzl4bGAKKLmzEQ==/com.asmzhang.testapp-Oe27OKKjcqmG8cwK--mosQ==/lib/arm64,
+            //          /data/app/~~tIm1tO5Ipzl4bGAKKLmzEQ==/com.asmzhang.testapp-Oe27OKKjcqmG8cwK--mosQ==/base.apk!/lib/arm64-v8a,
+            //           /system/lib64, /system_ext/lib64
+            //     ]
+            // ]]
+
+            //apk原始路径
             if (fileName.startsWith("/data/app/")) return true;
+
             if (fileName.startsWith("/data/priv-app/")) return true;
             if (fileName.startsWith("/data/local/tmp/")) return true;
-            if (fileName.startsWith("/data/data/")) return true; // 应用私有目录（cache/code_cache）
+            // /data/user/0/=/data/data/ 是缓存
+            if (fileName.startsWith("/data/user/0/")) return true; 
+            if (fileName.startsWith("/data/data/")) return true;
+            // /sdcard/=/storage/emulated/0/
             if (fileName.startsWith("/sdcard/")) return true;
             if (fileName.startsWith("/storage/emulated/0/")) return true;
 
