@@ -55,6 +55,9 @@
 #include "vdex_file.h"
 
 //add
+#include <atomic>
+#include <mutex>
+#include <set>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -155,6 +158,14 @@ namespace art {
                strstr(procName, "soong") == nullptr;
     }
 
+    // FART: 线程局部标志位，替代 self==nullptr 作为主动触发信号，避免误触发
+    thread_local bool g_fart_trace_active = false;
+    // FART: 原子计数器，配合 DEX 大小生成唯一文件名，解决同尺寸 DEX 覆盖问题
+    static std::atomic<int> g_fart_dump_counter{0};
+    // FART: 互斥锁 + 去重集合，基于 DEX 内存起始地址防止重复 dump
+    static std::mutex g_fart_mutex;
+    static std::set<const uint8_t*> g_dumped_dex_set;
+
     extern "C" void traceDexExecution(ArtMethod* artmethod) REQUIRES_SHARED(Locks::mutator_lock_) {
             char szCmdline[64] = {0};
             char szProcName[256] = {0};
@@ -187,6 +198,15 @@ namespace art {
             size_t size_ = dex_file->Size();
             int size_int = static_cast<int>(size_);
 
+            // 去重：跳过已 dump 过的 DEX（基于内存起始地址）
+            {
+                std::lock_guard<std::mutex> lock(g_fart_mutex);
+                if (g_dumped_dex_set.count(begin_) > 0) {
+                    return;
+                }
+                g_dumped_dex_set.insert(begin_);
+            }
+
             // 创建目录：/data/data/<packageName>/cyrus
             std::string base_dir = "/data/data/";
             std::string app_dir = base_dir + szProcName;
@@ -195,50 +215,51 @@ namespace art {
             ensure_dir_exists(app_dir);
             ensure_dir_exists(cyrus_dir);
 
+            // 计数器命名，避免同尺寸 DEX 覆盖（每次 dump 拿一个唯一编号）
+            int counter = g_fart_dump_counter.fetch_add(1);
             // 保存 dex 文件
-            std::string dex_path = cyrus_dir + "/" + std::to_string(size_int) + "_dex_file_execute.dex";
+            std::string dex_path = cyrus_dir + "/" + std::to_string(size_int) + "_" +
+                                   std::to_string(counter) + "_dex_file_execute.dex";
             // 保存 class 列表
-            std::string classlist_path = cyrus_dir + "/" + std::to_string(size_int) + "_class_list_execute.txt";
+            std::string classlist_path = cyrus_dir + "/" + std::to_string(size_int) + "_" +
+                                         std::to_string(counter) + "_class_list_execute.txt";
 
-            int dexfilefp = open(dex_path.c_str(), O_RDONLY);
-            if (dexfilefp >= 0) {
-                close(dexfilefp);
-            } else {
-                LOG(INFO) << "[traceDexExecution] " << artmethod->PrettyMethod() << " dump dex to " << dex_path;
+            LOG(INFO) << "[traceDexExecution] " << artmethod->PrettyMethod() << " dump dex to " << dex_path;
 
-                int fp = open(dex_path.c_str(), O_CREAT | O_APPEND | O_RDWR, 0666);
-                if (fp >= 0) {
-                    ssize_t w1 = write(fp, begin_, size_);
-                    if (w1 < 0) {
-                        LOG(ERROR) << "traceDexExecution: Failed to write dex file";
-                    }
-                    fsync(fp);
-                    close(fp);
-
-                    int class_list_file = open(classlist_path.c_str(), O_CREAT | O_APPEND | O_RDWR, 0666);
-                    if (class_list_file >= 0) {
-                        for (size_t ii = 0; ii < dex_file->NumClassDefs(); ++ii) {
-                            const dex::ClassDef& class_def = dex_file->GetClassDef(ii);
-                            const char* descriptor = dex_file->GetClassDescriptor(class_def);
-
-                            ssize_t w2 = write(class_list_file, descriptor, strlen(descriptor));
-                            if (w2 < 0) {
-                                LOG(ERROR) << "traceDexExecution: Failed to write class descriptor";
-                            }
-
-                            ssize_t w3 = write(class_list_file, "\n", 1);
-                            if (w3 < 0) {
-                                LOG(ERROR) << "traceDexExecution: Failed to write newline";
-                            }
-                        }
-                        fsync(class_list_file);
-                        close(class_list_file);
-                    } else {
-                        LOG(ERROR) << "[traceDexExecution] " << class_list_file << " open failed, class_list_file=" << class_list_file;
-                    }
-                } else {
-                    LOG(ERROR) << "[traceDexExecution] " << dex_path << " open failed, fp=" << fp;
+            int fp = open(dex_path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0666);
+            if (fp >= 0) {
+                ssize_t w1 = write(fp, begin_, size_);
+                if (w1 < 0) {
+                    LOG(ERROR) << "traceDexExecution: Failed to write dex file, errno=" << errno;
                 }
+                fsync(fp);
+                close(fp);
+
+                int class_list_file = open(classlist_path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0666);
+                if (class_list_file >= 0) {
+                    for (size_t ii = 0; ii < dex_file->NumClassDefs(); ++ii) {
+                        const dex::ClassDef& class_def = dex_file->GetClassDef(ii);
+                        const char* descriptor = dex_file->GetClassDescriptor(class_def);
+
+                        ssize_t w2 = write(class_list_file, descriptor, strlen(descriptor));
+                        if (w2 < 0) {
+                            LOG(ERROR) << "traceDexExecution: Failed to write class descriptor";
+                        }
+
+                        ssize_t w3 = write(class_list_file, "\n", 1);
+                        if (w3 < 0) {
+                            LOG(ERROR) << "traceDexExecution: Failed to write newline";
+                        }
+                    }
+                    fsync(class_list_file);
+                    close(class_list_file);
+                } else {
+                    LOG(ERROR) << "[traceDexExecution] open class list failed: " << classlist_path
+                               << ", errno=" << errno;
+                }
+            } else {
+                LOG(ERROR) << "[traceDexExecution] open dex failed: " << dex_path
+                           << ", errno=" << errno;
             }
     }
 
@@ -283,27 +304,37 @@ namespace art {
             ensure_dir_exists(app_dir);
             ensure_dir_exists(cyrus_dir);
 
-            // 保存 dex 文件
-            std::string dex_path = cyrus_dir + "/" + std::to_string(size_int) + "_dex_file.dex";
-            // 保存 class 列表
-            std::string class_list_path = cyrus_dir + "/" + std::to_string(size_int) + "_class_list.txt";
+            // 去重：跳过已 dump 过的 DEX（与 traceDexExecution 共用同一去重集合）
+            bool need_dump_dex = false;
+            int counter = 0;
+            {
+                std::lock_guard<std::mutex> lock(g_fart_mutex);
+                if (g_dumped_dex_set.count(begin_) == 0) {
+                    g_dumped_dex_set.insert(begin_);
+                    counter = g_fart_dump_counter.fetch_add(1);
+                    need_dump_dex = true;
+                }
+            }
 
-            int dexfilefp = open(dex_path.c_str(), O_RDONLY);
-            if (dexfilefp >= 0) {
-                close(dexfilefp);
-            } else {
+            // 计数器命名，避免同尺寸 DEX 覆盖（仅在首次 dump 时写入）
+            if (need_dump_dex) {
+                std::string dex_path = cyrus_dir + "/" + std::to_string(size_int) + "_" +
+                                       std::to_string(counter) + "_dex_file.dex";
+                std::string class_list_path = cyrus_dir + "/" + std::to_string(size_int) + "_" +
+                                              std::to_string(counter) + "_class_list.txt";
+
                 LOG(INFO) << "[traceMethodCode]" << artmethod->PrettyMethod() << " dump to " << dex_path;
 
-                int fp = open(dex_path.c_str(), O_CREAT | O_APPEND | O_RDWR, 0666);
+                int fp = open(dex_path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0666);
                 if (fp >= 0) {
                     ssize_t w = write(fp, begin_, size_);
                     if (w < 0) {
-                        LOG(ERROR) << "ArtMethod::traceMethodCode: write dexfile failed -> " << dex_path;
+                        LOG(ERROR) << "ArtMethod::traceMethodCode: write dexfile failed, errno=" << errno;
                     }
                     fsync(fp);
                     close(fp);
 
-                    int class_list_file = open(class_list_path.c_str(), O_CREAT | O_APPEND | O_RDWR, 0666);
+                    int class_list_file = open(class_list_path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0666);
                     if (class_list_file >= 0) {
                         for (size_t i = 0; i < dex_file->NumClassDefs(); ++i) {
                             const dex::ClassDef& class_def = dex_file->GetClassDef(i);
@@ -322,10 +353,12 @@ namespace art {
                         fsync(class_list_file);
                         close(class_list_file);
                     } else {
-                        LOG(ERROR) << "[traceMethodCode] " << class_list_path << " open failed, class_list_file=" << class_list_file;
+                        LOG(ERROR) << "[traceMethodCode] open class list failed: " << class_list_path
+                                   << ", errno=" << errno;
                     }
                 } else {
-                    LOG(ERROR) << "[traceMethodCode] " << dex_path << " open failed, fp=" << fp;
+                    LOG(ERROR) << "[traceMethodCode] open dex failed: " << dex_path
+                               << ", errno=" << errno;
                 }
             }
 
@@ -392,7 +425,10 @@ namespace art {
             uint32_t temp=6;
             uint32_t* args=&temp;
             uint32_t args_size=6;
+            // 通过线程局部标志位通知 Invoke，此次调用是 FART 主动触发，而非真实执行路径
+            g_fart_trace_active = true;
             artmethod->Invoke(self, args, args_size, result, "startCodeInspection");
+            g_fart_trace_active = false;
     }
     // add end
 
@@ -653,7 +689,8 @@ uint32_t ArtMethod::FindCatchBlock(Handle<mirror::Class> exception_type,
 void ArtMethod::Invoke(Thread* self, uint32_t* args, uint32_t args_size, JValue* result,
                        const char* shorty) {
   //add
-  if (self == nullptr) {
+  // 使用线程局部标志位替代 self==nullptr 判断：避免因其他代码路径传入 nullptr 导致误触发
+  if (g_fart_trace_active) {
     traceMethodCode(this);
     return;
   }

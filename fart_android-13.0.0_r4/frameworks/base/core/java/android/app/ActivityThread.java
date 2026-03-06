@@ -7999,7 +7999,7 @@ public final class ActivityThread extends ClientTransactionHandler
     private native void nPurgePendingResources();
     private native void nInitZygoteChildHeapProfiling();
 
-    //add
+    // add
     public static Field resolveDeclaredField(ClassLoader classloader, String class_name,
                                       String filedName) {
 
@@ -8120,64 +8120,67 @@ public final class ActivityThread extends ClientTransactionHandler
             return;
         }
 
+        if (dumpMethodCode_method == null) {
+            Log.e("ActivityThread", "[dispatchClassTask] dumpMethodCode_method is null, skip: " + eachclassname);
+            return;
+        }
+
         Class resultclass = null;
         try {
             resultclass = appClassloader.loadClass(eachclassname);
+        } catch (VerifyError e) {
+            // 类字节码校验失败（常见于加固壳未正确还原），不打印堆栈避免日志噪声
+            Log.w("ActivityThread", "[dispatchClassTask] VerifyError loading: " + eachclassname);
+            return;
         } catch (Exception e) {
-            e.printStackTrace();
+            Log.w("ActivityThread", "[dispatchClassTask] Exception loading: " + eachclassname + " -> " + e.getMessage());
             return;
         } catch (Error e) {
-            e.printStackTrace();
+            Log.w("ActivityThread", "[dispatchClassTask] Error loading: " + eachclassname + " -> " + e.getMessage());
             return;
         }
-        if (resultclass != null) {
-            try {
-                Constructor<?> cons[] = resultclass.getDeclaredConstructors();
-                for (Constructor<?> constructor : cons) {
-                    if (dumpMethodCode_method != null) {
-                        try {
-                            dumpMethodCode_method.invoke(null, constructor);
-                        } catch (Exception e) {
-                            e.printStackTrace();
-                            continue;
-                        } catch (Error e) {
-                            e.printStackTrace();
-                            continue;
-                        }
-                    } else {
-                        Log.e("ActivityThread", "dumpMethodCode_method is null ");
-                    }
 
+        if (resultclass == null) {
+            return;
+        }
+
+        // dump 所有构造方法的 CodeItem
+        try {
+            Constructor<?> cons[] = resultclass.getDeclaredConstructors();
+            for (Constructor<?> constructor : cons) {
+                try {
+                    dumpMethodCode_method.invoke(null, constructor);
+                } catch (Exception e) {
+                    // 单个构造方法 dump 失败不影响其他方法，继续
+                    continue;
+                } catch (Error e) {
+                    continue;
                 }
-            } catch (Exception e) {
-                e.printStackTrace();
-            } catch (Error e) {
-                e.printStackTrace();
             }
-            try {
-                Method[] methods = resultclass.getDeclaredMethods();
-                if (methods != null) {
-                    for (Method m : methods) {
-                        if (dumpMethodCode_method != null) {
-                            try {
-                                dumpMethodCode_method.invoke(null, m);
-                            } catch (Exception e) {
-                                e.printStackTrace();
-                                continue;
-                            } catch (Error e) {
-                                e.printStackTrace();
-                                continue;
-                            }
-                        } else {
-                            Log.e("ActivityThread", "dumpMethodCode_method is null ");
-                        }
+        } catch (Exception e) {
+            Log.w("ActivityThread", "[dispatchClassTask] getDeclaredConstructors failed: " + eachclassname);
+        } catch (Error e) {
+            Log.w("ActivityThread", "[dispatchClassTask] getDeclaredConstructors error: " + eachclassname);
+        }
+
+        // dump 所有普通方法的 CodeItem
+        try {
+            Method[] methods = resultclass.getDeclaredMethods();
+            if (methods != null) {
+                for (Method m : methods) {
+                    try {
+                        dumpMethodCode_method.invoke(null, m);
+                    } catch (Exception e) {
+                        continue;
+                    } catch (Error e) {
+                        continue;
                     }
                 }
-            } catch (Exception e) {
-                e.printStackTrace();
-            } catch (Error e) {
-                e.printStackTrace();
             }
+        } catch (Exception e) {
+            Log.w("ActivityThread", "[dispatchClassTask] getDeclaredMethods failed: " + eachclassname);
+        } catch (Error e) {
+            Log.w("ActivityThread", "[dispatchClassTask] getDeclaredMethods error: " + eachclassname);
         }
     }
 
