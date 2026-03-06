@@ -8455,6 +8455,24 @@ public final class ActivityThread extends ClientTransactionHandler
         return null;
     }
 
+    //递归删除文件夹
+    private static boolean deleteRecursive(java.io.File fileOrDir) {
+        if (fileOrDir == null || !fileOrDir.exists()) {
+            return false;
+        }
+
+        if (fileOrDir.isDirectory()) {
+            java.io.File[] children = fileOrDir.listFiles();
+            if (children != null) {
+                for (java.io.File child : children) {
+                    deleteRecursive(child);
+                }
+            }
+        }
+
+        return fileOrDir.delete();
+    }
+
     /**
      * 将真实 Application 类名写入 /data/data/{pkg}/cyrus/real_app_class.txt
      * 写入前先删除旧目录再创建
