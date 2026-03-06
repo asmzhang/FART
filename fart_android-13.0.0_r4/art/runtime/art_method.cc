@@ -56,8 +56,10 @@
 
 //add
 #include <atomic>
+#include <map>
 #include <mutex>
 #include <set>
+#include <vector>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -165,6 +167,12 @@ namespace art {
     // FART: 互斥锁 + 去重集合，基于 DEX 内存起始地址防止重复 dump
     static std::mutex g_fart_mutex;
     static std::set<const uint8_t*> g_dumped_dex_set;
+    // FART fix: 是否启用内存修复DEX功能（将CodeItem回写生成修复后的DEX）
+    static std::atomic<bool> g_fart_fix_enabled{false};
+    // FART fix: DEX起始地址 → 可写缓冲区（受 g_fart_mutex 保护）
+    static std::map<const uint8_t*, std::vector<uint8_t>> g_dex_fix_buffers;
+    // FART fix: DEX起始地址 → 文件计数器（受 g_fart_mutex 保护）
+    static std::map<const uint8_t*, int> g_dex_counter_map;
 
     extern "C" void traceDexExecution(ArtMethod* artmethod) REQUIRES_SHARED(Locks::mutator_lock_) {
             char szCmdline[64] = {0};
@@ -198,15 +206,6 @@ namespace art {
             size_t size_ = dex_file->Size();
             int size_int = static_cast<int>(size_);
 
-            // 去重：跳过已 dump 过的 DEX（基于内存起始地址）
-            {
-                std::lock_guard<std::mutex> lock(g_fart_mutex);
-                if (g_dumped_dex_set.count(begin_) > 0) {
-                    return;
-                }
-                g_dumped_dex_set.insert(begin_);
-            }
-
             // 创建目录：/data/data/<packageName>/cyrus
             std::string base_dir = "/data/data/";
             std::string app_dir = base_dir + szProcName;
@@ -215,8 +214,23 @@ namespace art {
             ensure_dir_exists(app_dir);
             ensure_dir_exists(cyrus_dir);
 
-            // 计数器命名，避免同尺寸 DEX 覆盖（每次 dump 拿一个唯一编号）
-            int counter = g_fart_dump_counter.fetch_add(1);
+            // 去重：跳过已 dump 过的 DEX（基于内存起始地址）；同时分配计数器并初始化 fix 缓冲区
+            int counter = 0;
+            {
+                std::lock_guard<std::mutex> lock(g_fart_mutex);
+                if (g_dumped_dex_set.count(begin_) > 0) {
+                    return;
+                }
+                g_dumped_dex_set.insert(begin_);
+                counter = g_fart_dump_counter.fetch_add(1);
+                g_dex_counter_map[begin_] = counter;
+                if (g_fart_fix_enabled.load()) {
+                    auto& buf = g_dex_fix_buffers[begin_];
+                    if (buf.empty()) {
+                        buf.assign(begin_, begin_ + size_);
+                    }
+                }
+            }
             // 保存 dex 文件
             std::string dex_path = cyrus_dir + "/" + std::to_string(size_int) + "_" +
                                    std::to_string(counter) + "_dex_file_execute.dex";
@@ -300,9 +314,11 @@ namespace art {
             std::string base_dir = "/data/data/";
             std::string app_dir = base_dir + szProcName;
             std::string cyrus_dir = app_dir + "/cyrus";
+            std::string fix_dir = cyrus_dir + "/fix";
 
             ensure_dir_exists(app_dir);
             ensure_dir_exists(cyrus_dir);
+            ensure_dir_exists(fix_dir);
 
             // 去重：跳过已 dump 过的 DEX（与 traceDexExecution 共用同一去重集合）
             bool need_dump_dex = false;
@@ -313,6 +329,15 @@ namespace art {
                     g_dumped_dex_set.insert(begin_);
                     counter = g_fart_dump_counter.fetch_add(1);
                     need_dump_dex = true;
+                    g_dex_counter_map[begin_] = counter;
+                } else {
+                    counter = g_dex_counter_map[begin_];
+                }
+                if (g_fart_fix_enabled.load()) {
+                    auto& buf = g_dex_fix_buffers[begin_];
+                    if (buf.empty()) {
+                        buf.assign(begin_, begin_ + size_);
+                    }
                 }
             }
 
@@ -417,6 +442,66 @@ namespace art {
                     LOG(ERROR) << "[traceMethodCode] " << ins_path << " open failed, fp2=" << fp2;
                 }
             }
+
+            // Fix DEX: 将真实 CodeItem 指令回写到内存缓冲区
+            if (g_fart_fix_enabled.load()) {
+                std::lock_guard<std::mutex> lock(g_fart_mutex);
+                auto it = g_dex_fix_buffers.find(begin_);
+                if (it != g_dex_fix_buffers.end() && !it->second.empty()) {
+                    if (offset >= 0 && (size_t)(offset + code_item_len) <= it->second.size()) {
+                        memcpy(it->second.data() + offset, item, code_item_len);
+                    }
+                }
+            }
+    }
+
+    extern "C" void setFartFixEnabled(bool enabled) {
+        g_fart_fix_enabled.store(enabled);
+        LOG(INFO) << "[setFartFixEnabled] fix mode " << (enabled ? "enabled" : "disabled");
+    }
+
+    // 将所有已收集的修复缓冲区写入 *_dex_file_fix.dex 文件
+    extern "C" void flushFixedDex() {
+        char szProcName[256] = {0};
+        int procid = getpid();
+        char szCmdline[64] = {0};
+        snprintf(szCmdline, sizeof(szCmdline), "/proc/%d/cmdline", procid);
+        int fcmdline = open(szCmdline, O_RDONLY);
+        if (fcmdline >= 0) {
+            read(fcmdline, szProcName, sizeof(szProcName) - 1);
+            close(fcmdline);
+        }
+        if (szProcName[0] == '\0' || !isValidAndroidApp(szProcName)) {
+            LOG(WARNING) << "[flushFixedDex] 进程名非法，跳过";
+            return;
+        }
+        std::string cyrus_dir = std::string("/data/data/") + szProcName + "/cyrus";
+
+        // 在锁内拷贝需要写出的数据，避免持锁期间做文件 I/O
+        struct FixEntry { int size_int; int counter; std::vector<uint8_t> buf; };
+        std::vector<FixEntry> entries;
+        {
+            std::lock_guard<std::mutex> lock(g_fart_mutex);
+            for (auto& kv : g_dex_fix_buffers) {
+                auto it = g_dex_counter_map.find(kv.first);
+                if (it == g_dex_counter_map.end() || kv.second.empty()) continue;
+                entries.push_back({static_cast<int>(kv.second.size()), it->second, kv.second});
+            }
+        }
+
+        for (auto& e : entries) {
+            std::string fix_path = fix_dir + "/" + std::to_string(e.size_int) + "_" +
+                                   std::to_string(e.counter) + "_dex_file_fix.dex";
+            int fp = open(fix_path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0666);
+            if (fp >= 0) {
+                write(fp, e.buf.data(), e.buf.size());
+                fsync(fp);
+                close(fp);
+                LOG(INFO) << "[flushFixedDex] written: " << fix_path;
+            } else {
+                LOG(ERROR) << "[flushFixedDex] open failed: " << fix_path << ", errno=" << errno;
+            }
+        }
     }
 
     extern "C" void callNativeMethodInspector(ArtMethod* artmethod) REQUIRES_SHARED(Locks::mutator_lock_) {

@@ -14,6 +14,7 @@ public class Cyrus {
     private static boolean initialized = false;
 
     private static boolean dumpEnabled = false;
+    private static boolean fixEnabled = false;
     private static int sleepTimeMs = 60 * 1000;
     private static List<Pattern> forceCallClassPatterns = new ArrayList<>();
     private static List<Pattern> ignoredClassPatterns = new ArrayList<>();
@@ -42,6 +43,8 @@ public class Cyrus {
                 line = line.trim();
                 if (line.startsWith("dump=")) {
                     dumpEnabled = line.substring(5).equalsIgnoreCase("true");
+                } else if (line.startsWith("is_fix=")) {
+                    fixEnabled = line.substring(7).equalsIgnoreCase("true");
                 } else if (line.startsWith("sleep=")) {
                     sleepTimeMs = Integer.parseInt(line.substring(6));
                 } else if (line.startsWith("force=")) {
@@ -69,6 +72,14 @@ public class Cyrus {
      */
     public static boolean isDumpEnabled() {
         return dumpEnabled;
+    }
+
+    /**
+     * 是否启用直接修复DEX功能（将dump到的CodeItem回写，生成修复后的DEX）
+     * @return true 表示启用
+     */
+    public static boolean isFixEnabled() {
+        return fixEnabled;
     }
 
     /**

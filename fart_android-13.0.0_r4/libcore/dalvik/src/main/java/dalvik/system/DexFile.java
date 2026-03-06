@@ -720,5 +720,9 @@ public final class DexFile {
 
     //add
     private static native void nativeDumpCode(Object m);
+    /** 通知 native 层是否启用修复DEX模式 */
+    static native void nativeSetFixEnabled(boolean enabled);
+    /** 将所有已修复的DEX缓冲区写入 *_dex_file_fix.dex 文件 */
+    static native void nativeFlushFixedDex();
     //add end
 }

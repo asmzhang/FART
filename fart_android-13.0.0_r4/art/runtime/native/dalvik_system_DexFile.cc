@@ -63,12 +63,22 @@ namespace art {
     //add
     extern "C" void callNativeMethodInspector(ArtMethod* artmethod);
     extern "C" ArtMethod* convertToArtMethodPtr(JNIEnv* env, jobject javaMethod);
-    static void DexFile_nativeDumpCode(JNIEnv* env, jclass,jobject method) {
-        if(method!=nullptr) {
+    extern "C" void setFartFixEnabled(bool enabled);
+    extern "C" void flushFixedDex();
+
+    static void DexFile_nativeDumpCode(JNIEnv* env, jclass, jobject method) {
+        if (method != nullptr) {
             ArtMethod* proxy_method = convertToArtMethodPtr(env, method);
             callNativeMethodInspector(proxy_method);
         }
-        return;
+    }
+
+    static void DexFile_nativeSetFixEnabled(JNIEnv*, jclass, jboolean enabled) {
+        setFartFixEnabled(enabled == JNI_TRUE);
+    }
+
+    static void DexFile_nativeFlushFixedDex(JNIEnv*, jclass) {
+        flushFixedDex();
     }
     //add end
 using android::base::StringPrintf;
@@ -987,6 +997,8 @@ static JNINativeMethod gMethods[] = {
   NATIVE_METHOD(DexFile, setTrusted, "(Ljava/lang/Object;)V"),
   //add
   NATIVE_METHOD(DexFile, nativeDumpCode, "(Ljava/lang/Object;)V"),
+  NATIVE_METHOD(DexFile, nativeSetFixEnabled, "(Z)V"),
+  NATIVE_METHOD(DexFile, nativeFlushFixedDex, "()V"),
   //add end
 };
 

@@ -8316,10 +8316,33 @@ public final class ActivityThread extends ClientTransactionHandler
                         e.printStackTrace();
                     }
 
+                    // 通知 native 层 fix 模式开关
+                    try {
+                        Class<?> dexFileClazz = Class.forName("dalvik.system.DexFile");
+                        java.lang.reflect.Method setFixMethod = dexFileClazz.getDeclaredMethod("nativeSetFixEnabled", boolean.class);
+                        setFixMethod.setAccessible(true);
+                        setFixMethod.invoke(null, Cyrus.isFixEnabled());
+                    } catch (Exception e) {
+                        Log.e("ActivityThread", "nativeSetFixEnabled failed: " + e.getMessage());
+                    }
+
                     // 开始脱壳
                     Log.e("ActivityThread", "sleep over and start startCodeInspection");
                     startCodeInspection();
                     Log.e("ActivityThread", "startCodeInspection run over");
+
+                    // fix 模式：扫描完成后将修复缓冲区写入磁盘
+                    if (Cyrus.isFixEnabled()) {
+                        try {
+                            Class<?> dexFileClazz = Class.forName("dalvik.system.DexFile");
+                            java.lang.reflect.Method flushMethod = dexFileClazz.getDeclaredMethod("nativeFlushFixedDex");
+                            flushMethod.setAccessible(true);
+                            flushMethod.invoke(null);
+                            Log.e("ActivityThread", "nativeFlushFixedDex done");
+                        } catch (Exception e) {
+                            Log.e("ActivityThread", "nativeFlushFixedDex failed: " + e.getMessage());
+                        }
+                    }
                 }
             }
         }).start();
