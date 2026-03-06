@@ -39,6 +39,7 @@ force=com.target.app.*,com.target.lib.*
 dump=true
 sleep=10000
 ignore=com.android.*,androidx.*,kotlin.*
+ignore=com.luoye.dpt.junkcode.*
 第二步：启动目标应用
 
 # 方式一：直接启动

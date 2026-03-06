@@ -438,19 +438,19 @@ namespace art {
 
                     fsync(fp2);
                     close(fp2);
+
+                    // Fix DEX: 将真实 CodeItem 指令回写到内存缓冲区
+                    if (g_fart_fix_enabled.load()) {
+                      std::lock_guard<std::mutex> lock(g_fart_mutex);
+                      auto it = g_dex_fix_buffers.find(begin_);
+                      if (it != g_dex_fix_buffers.end() && !it->second.empty()) {
+                          if (offset >= 0 && (size_t)(offset + code_item_len) <= it->second.size()) {
+                              memcpy(it->second.data() + offset, item, code_item_len);
+                          }
+                      }
+                    }
                 } else {
                     LOG(ERROR) << "[traceMethodCode] " << ins_path << " open failed, fp2=" << fp2;
-                }
-            }
-
-            // Fix DEX: 将真实 CodeItem 指令回写到内存缓冲区
-            if (g_fart_fix_enabled.load()) {
-                std::lock_guard<std::mutex> lock(g_fart_mutex);
-                auto it = g_dex_fix_buffers.find(begin_);
-                if (it != g_dex_fix_buffers.end() && !it->second.empty()) {
-                    if (offset >= 0 && (size_t)(offset + code_item_len) <= it->second.size()) {
-                        memcpy(it->second.data() + offset, item, code_item_len);
-                    }
                 }
             }
     }
@@ -464,18 +464,35 @@ namespace art {
     extern "C" void flushFixedDex() {
         char szProcName[256] = {0};
         int procid = getpid();
+
+        // 获取进程名
         char szCmdline[64] = {0};
         snprintf(szCmdline, sizeof(szCmdline), "/proc/%d/cmdline", procid);
         int fcmdline = open(szCmdline, O_RDONLY);
         if (fcmdline >= 0) {
-            read(fcmdline, szProcName, sizeof(szProcName) - 1);
+            ssize_t result = read(fcmdline, szProcName, sizeof(szProcName) - 1);
+            if (result < 0) {
+                LOG(ERROR) << "[flushFixedDex]: read cmdline failed.";
+            }
             close(fcmdline);
+        } else {
+            LOG(ERROR) << "[flushFixedDex] " << szCmdline << " open failed ";
         }
-        if (szProcName[0] == '\0' || !isValidAndroidApp(szProcName)) {
-            LOG(WARNING) << "[flushFixedDex] 进程名非法，跳过";
+
+        if (szProcName[0] == '\0') {
+            LOG(WARNING) << "[flushFixedDex] 获取进程名失败";
             return;
         }
+
+        if (!isValidAndroidApp(szProcName)) {
+            LOG(WARNING) << "[flushFixedDex] 当前进程 " << szProcName << " 非法，跳过 dex dump";
+            return;
+        }
+
+
+
         std::string cyrus_dir = std::string("/data/data/") + szProcName + "/cyrus";
+        std::string fix_dir = cyrus_dir + "/fix";
 
         // 在锁内拷贝需要写出的数据，避免持锁期间做文件 I/O
         struct FixEntry { int size_int; int counter; std::vector<uint8_t> buf; };
@@ -494,10 +511,13 @@ namespace art {
                                    std::to_string(e.counter) + "_dex_file_fix.dex";
             int fp = open(fix_path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0666);
             if (fp >= 0) {
-                write(fp, e.buf.data(), e.buf.size());
-                fsync(fp);
-                close(fp);
-                LOG(INFO) << "[flushFixedDex] written: " << fix_path;
+              ssize_t w = write(fp, e.buf.data(), e.buf.size());
+              if (w < 0) {
+                LOG(ERROR) << "[flushFixedDex]: write dexfile failed, errno=" << errno;
+              }
+              fsync(fp);
+              close(fp);
+              LOG(INFO) << "[flushFixedDex] written: " << fix_path;
             } else {
                 LOG(ERROR) << "[flushFixedDex] open failed: " << fix_path << ", errno=" << errno;
             }
