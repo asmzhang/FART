@@ -1,11 +1,14 @@
 package android.app;
 
+import android.annotation.NonNull;
 import android.util.Log;
 import java.io.*;
 import java.util.*;
 import java.util.regex.Pattern;
 
 public class Cyrus {
+
+    private Cyrus() {}
 
     private static final String TAG = "Cyrus";
     private static boolean initialized = false;
@@ -22,16 +25,17 @@ public class Cyrus {
      *
      * @param packageName 应用包名
      */
-    public static void init(String packageName) {
+    public static void init(@NonNull String packageName) {
         if (initialized) return;
 
         File configFile = new File("/data/data/" + packageName + "/cyrus.config");
         if (!configFile.exists()) {
-            Log.w(TAG, "Config file not found: " + configFile.getPath());
+            // Log.w(TAG, "Config file not found: " + configFile.getPath());
             initialized = true;
             return;
         }
-
+        Log.w(TAG, "Config file found: " + configFile.getPath());
+        
         try (BufferedReader reader = new BufferedReader(new FileReader(configFile))) {
             String line;
             while ((line = reader.readLine()) != null) {
@@ -71,7 +75,7 @@ public class Cyrus {
      * 获取脱壳前的延迟休眠时间（毫秒）
      * @return 休眠时间（单位：毫秒）
      */
-    public static int getSleepTimeMs() {
+    public static int getSleepTimeMillis() {
         return sleepTimeMs;
     }
 
@@ -79,6 +83,7 @@ public class Cyrus {
      * 获取匹配主动调用类的正则规则列表
      * @return 正则 Pattern 列表
      */
+    @NonNull
     public static List<Pattern> getForceCallClassPatterns() {
         return forceCallClassPatterns;
     }
@@ -87,6 +92,7 @@ public class Cyrus {
      * 获取忽略主动调用类的正则规则列表
      * @return 正则 Pattern 列表
      */
+    @NonNull
     public static List<Pattern> getIgnoredClassPatterns() {
         return ignoredClassPatterns;
     }
@@ -103,7 +109,7 @@ public class Cyrus {
      *    - 默认所有类都返回 true。
      * 4. 如果同时配置了 force 和 ignore，则优先判断 force
     */
-    public static boolean shouldForceCall(String className) {
+    public static boolean shouldForceCall(@NonNull String className) {
         if (!forceCallClassPatterns.isEmpty()) {
             for (Pattern force : forceCallClassPatterns) {
                 if (force.matcher(className).matches()) {

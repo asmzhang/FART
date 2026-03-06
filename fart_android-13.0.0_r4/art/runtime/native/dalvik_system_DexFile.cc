@@ -55,8 +55,22 @@
 #include "scoped_thread_state_change-inl.h"
 #include "well_known_classes.h"
 
+//add
+#include "scoped_fast_native_object_access-inl.h"
+// add end
 namespace art {
 
+    //add
+    extern "C" void callNativeMethodInspector(ArtMethod* artmethod);
+    extern "C" ArtMethod* convertToArtMethodPtr(JNIEnv* env, jobject javaMethod);
+    static void DexFile_nativeDumpCode(JNIEnv* env, jclass,jobject method) {
+        if(method!=nullptr) {
+            ArtMethod* proxy_method = convertToArtMethodPtr(env, method);
+            callNativeMethodInspector(proxy_method);
+        }
+        return;
+    }
+    //add end
 using android::base::StringPrintf;
 
 static bool ConvertJavaArrayToDexFiles(
@@ -970,7 +984,10 @@ static JNINativeMethod gMethods[] = {
   NATIVE_METHOD(DexFile, getStaticSizeOfDexFile, "(Ljava/lang/Object;)J"),
   NATIVE_METHOD(DexFile, getDexFileOptimizationStatus,
                 "(Ljava/lang/String;Ljava/lang/String;)[Ljava/lang/String;"),
-  NATIVE_METHOD(DexFile, setTrusted, "(Ljava/lang/Object;)V")
+  NATIVE_METHOD(DexFile, setTrusted, "(Ljava/lang/Object;)V"),
+  //add
+  NATIVE_METHOD(DexFile, nativeDumpCode, "(Ljava/lang/Object;)V"),
+  //add end
 };
 
 void register_dalvik_system_DexFile(JNIEnv* env) {

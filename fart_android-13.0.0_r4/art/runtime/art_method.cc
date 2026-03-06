@@ -54,7 +54,347 @@
 #include "scoped_thread_state_change-inl.h"
 #include "vdex_file.h"
 
+//add
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include "runtime.h"
+#include <android/log.h>
+#include <assert.h>
+#include <errno.h>
+#include <pthread.h>
+#include <stdarg.h>
+#include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/uio.h>
+#include <sys/un.h>
+#include <time.h>
+#include <unistd.h>
+
+#define gettidv1() syscall(__NR_gettid)
+#define LOG_TAG "ActivityThread"
+#define ALOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+// add end
+
 namespace art {
+
+    //add
+    uint8_t* getDexCodeItemEnd(const uint8_t **pData){
+        uint32_t num_of_list = DecodeUnsignedLeb128(pData);
+        for (;num_of_list>0;num_of_list--) {
+            int32_t num_of_handlers=DecodeSignedLeb128(pData);
+            int num=num_of_handlers;
+            if (num_of_handlers<=0) {
+                num=-num_of_handlers;
+            }
+            for (; num > 0; num--) {
+                DecodeUnsignedLeb128(pData);
+                DecodeUnsignedLeb128(pData);
+            }
+            if (num_of_handlers<=0) {
+                DecodeUnsignedLeb128(pData);
+            }
+        }
+        return (uint8_t*)(*pData);
+    }
+
+    extern "C" char *encodeBase64Buffer(char *str,long str_len,long* outlen){
+        long len;
+        char *res;
+        int i,j;
+        const char *base64_table="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+        if(str_len % 3 == 0)
+            len=str_len/3*4;
+        else
+            len=(str_len/3+1)*4;
+
+        res=(char*)malloc(sizeof(char)*(len+1));
+        res[len]='\0';
+        *outlen=len;
+
+        for(i=0,j=0;i<len-2;j+=3,i+=4){
+            res[i]=base64_table[str[j]>>2];
+            res[i+1]=base64_table[(str[j]&0x3)<<4 | (str[j+1]>>4)];
+            res[i+2]=base64_table[(str[j+1]&0xf)<<2 | (str[j+2]>>6)];
+            res[i+3]=base64_table[str[j+2]&0x3f];
+        }
+
+        switch(str_len % 3){
+            case 1:
+                res[i-2]='=';
+                res[i-1]='=';
+                break;
+            case 2:
+                res[i-1]='=';
+                break;
+        }
+        return res;
+    }
+
+    //创建目录
+    bool ensure_dir_exists(const std::string& path) {
+        int res = mkdir(path.c_str(), 0777);
+        if (res == 0 || errno == EEXIST) {
+            return true;
+        } else {
+            LOG(ERROR) << "mkdir failed: " << path << ", errno=" << errno << ", " << errno;
+            return false;
+        }
+    }
+
+    //跳过 Android 编译构建阶段的 dex2oatd 工具执行时的调用
+    bool isValidAndroidApp(const char* procName) {
+        return procName != nullptr &&
+               strstr(procName, "/") == nullptr &&
+               strstr(procName, "dex2oat") == nullptr &&
+               strstr(procName, "soong") == nullptr;
+    }
+
+    extern "C" void traceDexExecution(ArtMethod* artmethod) REQUIRES_SHARED(Locks::mutator_lock_) {
+            char szCmdline[64] = {0};
+            char szProcName[256] = {0};
+            int procid = getpid();
+            snprintf(szCmdline, sizeof(szCmdline), "/proc/%d/cmdline", procid);
+
+            int fcmdline = open(szCmdline, O_RDONLY);
+            if (fcmdline >= 0) {
+                ssize_t result = read(fcmdline, szProcName, sizeof(szProcName) - 1);
+                if (result < 0) {
+                    LOG(ERROR) << "traceDexExecution: Failed to read cmdline";
+                }
+                close(fcmdline);
+            } else {
+                LOG(ERROR) << "[traceDexExecution] " << szCmdline << " open failed ";
+            }
+
+            if (szProcName[0] == '\0') {
+                LOG(WARNING) << "[traceDexExecution] 获取进程名失败：" << artmethod->PrettyMethod();
+                return;
+            }
+
+            if (!isValidAndroidApp(szProcName)) {
+                LOG(WARNING) << "[traceDexExecution] 当前进程 " << szProcName << " 非法，跳过 dex dump";
+                return;
+            }
+
+            const DexFile* dex_file = artmethod->GetDexFile();
+            const uint8_t* begin_ = dex_file->Begin();
+            size_t size_ = dex_file->Size();
+            int size_int = static_cast<int>(size_);
+
+            // 创建目录：/data/data/<packageName>/cyrus
+            std::string base_dir = "/data/data/";
+            std::string app_dir = base_dir + szProcName;
+            std::string cyrus_dir = app_dir + "/cyrus";
+
+            ensure_dir_exists(app_dir);
+            ensure_dir_exists(cyrus_dir);
+
+            // 保存 dex 文件
+            std::string dex_path = cyrus_dir + "/" + std::to_string(size_int) + "_dex_file_execute.dex";
+            // 保存 class 列表
+            std::string classlist_path = cyrus_dir + "/" + std::to_string(size_int) + "_class_list_execute.txt";
+
+            int dexfilefp = open(dex_path.c_str(), O_RDONLY);
+            if (dexfilefp >= 0) {
+                close(dexfilefp);
+            } else {
+                LOG(INFO) << "[traceDexExecution] " << artmethod->PrettyMethod() << " dump dex to " << dex_path;
+
+                int fp = open(dex_path.c_str(), O_CREAT | O_APPEND | O_RDWR, 0666);
+                if (fp >= 0) {
+                    ssize_t w1 = write(fp, begin_, size_);
+                    if (w1 < 0) {
+                        LOG(ERROR) << "traceDexExecution: Failed to write dex file";
+                    }
+                    fsync(fp);
+                    close(fp);
+
+                    int class_list_file = open(classlist_path.c_str(), O_CREAT | O_APPEND | O_RDWR, 0666);
+                    if (class_list_file >= 0) {
+                        for (size_t ii = 0; ii < dex_file->NumClassDefs(); ++ii) {
+                            const dex::ClassDef& class_def = dex_file->GetClassDef(ii);
+                            const char* descriptor = dex_file->GetClassDescriptor(class_def);
+
+                            ssize_t w2 = write(class_list_file, descriptor, strlen(descriptor));
+                            if (w2 < 0) {
+                                LOG(ERROR) << "traceDexExecution: Failed to write class descriptor";
+                            }
+
+                            ssize_t w3 = write(class_list_file, "\n", 1);
+                            if (w3 < 0) {
+                                LOG(ERROR) << "traceDexExecution: Failed to write newline";
+                            }
+                        }
+                        fsync(class_list_file);
+                        close(class_list_file);
+                    } else {
+                        LOG(ERROR) << "[traceDexExecution] " << class_list_file << " open failed, class_list_file=" << class_list_file;
+                    }
+                } else {
+                    LOG(ERROR) << "[traceDexExecution] " << dex_path << " open failed, fp=" << fp;
+                }
+            }
+    }
+
+    extern "C" void traceMethodCode(ArtMethod* artmethod) REQUIRES_SHARED(Locks::mutator_lock_) {
+            char szProcName[256] = {0};
+            int procid = getpid();
+
+            // 获取进程名
+            char szCmdline[64] = {0};
+            snprintf(szCmdline, sizeof(szCmdline), "/proc/%d/cmdline", procid);
+            int fcmdline = open(szCmdline, O_RDONLY);
+            if (fcmdline >= 0) {
+                ssize_t result = read(fcmdline, szProcName, sizeof(szProcName) - 1);
+                if (result < 0) {
+                    LOG(ERROR) << "ArtMethod::traceMethodCode: read cmdline failed.";
+                }
+                close(fcmdline);
+            } else {
+                LOG(ERROR) << "[traceMethodCode] " << szCmdline << " open failed ";
+            }
+
+            if (szProcName[0] == '\0') {
+                LOG(WARNING) << "[traceMethodCode] 获取进程名失败：" << artmethod->PrettyMethod();
+                return;
+            }
+
+            if (!isValidAndroidApp(szProcName)) {
+                LOG(WARNING) << "[traceMethodCode] 当前进程 " << szProcName << " 非法，跳过 dex dump";
+                return;
+            }
+
+            const DexFile* dex_file = artmethod->GetDexFile();
+            const uint8_t* begin_ = dex_file->Begin();
+            size_t size_ = dex_file->Size();
+            int size_int = static_cast<int>(size_);
+
+            // 创建目录：/data/data/<packageName>/cyrus
+            std::string base_dir = "/data/data/";
+            std::string app_dir = base_dir + szProcName;
+            std::string cyrus_dir = app_dir + "/cyrus";
+
+            ensure_dir_exists(app_dir);
+            ensure_dir_exists(cyrus_dir);
+
+            // 保存 dex 文件
+            std::string dex_path = cyrus_dir + "/" + std::to_string(size_int) + "_dex_file.dex";
+            // 保存 class 列表
+            std::string class_list_path = cyrus_dir + "/" + std::to_string(size_int) + "_class_list.txt";
+
+            int dexfilefp = open(dex_path.c_str(), O_RDONLY);
+            if (dexfilefp >= 0) {
+                close(dexfilefp);
+            } else {
+                LOG(INFO) << "[traceMethodCode]" << artmethod->PrettyMethod() << " dump to " << dex_path;
+
+                int fp = open(dex_path.c_str(), O_CREAT | O_APPEND | O_RDWR, 0666);
+                if (fp >= 0) {
+                    ssize_t w = write(fp, begin_, size_);
+                    if (w < 0) {
+                        LOG(ERROR) << "ArtMethod::traceMethodCode: write dexfile failed -> " << dex_path;
+                    }
+                    fsync(fp);
+                    close(fp);
+
+                    int class_list_file = open(class_list_path.c_str(), O_CREAT | O_APPEND | O_RDWR, 0666);
+                    if (class_list_file >= 0) {
+                        for (size_t i = 0; i < dex_file->NumClassDefs(); ++i) {
+                            const dex::ClassDef& class_def = dex_file->GetClassDef(i);
+                            const char* descriptor = dex_file->GetClassDescriptor(class_def);
+
+                            ssize_t w1 = write(class_list_file, descriptor, strlen(descriptor));
+                            if (w1 < 0) {
+                                LOG(ERROR) << "ArtMethod::traceMethodCode: write class descriptor failed";
+                            }
+
+                            ssize_t w2 = write(class_list_file, "\n", 1);
+                            if (w2 < 0) {
+                                LOG(ERROR) << "ArtMethod::traceMethodCode: write newline failed";
+                            }
+                        }
+                        fsync(class_list_file);
+                        close(class_list_file);
+                    } else {
+                        LOG(ERROR) << "[traceMethodCode] " << class_list_path << " open failed, class_list_file=" << class_list_file;
+                    }
+                } else {
+                    LOG(ERROR) << "[traceMethodCode] " << dex_path << " open failed, fp=" << fp;
+                }
+            }
+
+            // 保存指令码
+            const dex::CodeItem* code_item = artmethod->GetCodeItem();
+            if (LIKELY(code_item != nullptr)) {
+                uint8_t* item = (uint8_t*)code_item;
+                int code_item_len = 0;
+                CodeItemDataAccessor accessor(*dex_file, code_item);
+                if (accessor.TriesSize() > 0) {
+                    const uint8_t* handler_data = accessor.GetCatchHandlerData();
+                    uint8_t* tail = getDexCodeItemEnd(&handler_data);
+                    code_item_len = static_cast<int>(tail - item);
+                } else {
+                    code_item_len = 16 + accessor.InsnsSizeInCodeUnits() * 2;
+                }
+
+                uint32_t method_idx = artmethod->GetDexMethodIndex();
+                int offset = static_cast<int>(item - begin_);
+                pid_t tid = gettidv1();
+                // 保存 CodeItem
+                std::string ins_path = cyrus_dir + "/" + std::to_string(size_int) + "_ins_" + std::to_string(tid) + ".bin";
+
+                int fp2 = open(ins_path.c_str(), O_CREAT | O_APPEND | O_RDWR, 0666);
+                if (fp2 >= 0) {
+                    lseek(fp2, 0, SEEK_END);
+                    std::string header = "{name:" + artmethod->PrettyMethod() +
+                                         ",method_idx:" + std::to_string(method_idx) +
+                                         ",offset:" + std::to_string(offset) +
+                                         ",code_item_len:" + std::to_string(code_item_len) +
+                                         ",ins:";
+
+                    ssize_t w3 = write(fp2, header.c_str(), header.length());
+                    if (w3 < 0) {
+                        LOG(ERROR) << "ArtMethod::traceMethodCode: write header failed";
+                    }
+
+                    long outlen = 0;
+                    char* base64result = encodeBase64Buffer((char*)item, (long)code_item_len, &outlen);
+                    if (base64result != nullptr) {
+                        ssize_t w4 = write(fp2, base64result, outlen);
+                        if (w4 < 0) {
+                            LOG(ERROR) << "ArtMethod::traceMethodCode: write base64 ins failed";
+                        }
+                        free(base64result);
+                    }
+
+                    ssize_t w5 = write(fp2, "};", 2);
+                    if (w5 < 0) {
+                        LOG(ERROR) << "ArtMethod::traceMethodCode: write tail failed";
+                    }
+
+                    fsync(fp2);
+                    close(fp2);
+                } else {
+                    LOG(ERROR) << "[traceMethodCode] " << ins_path << " open failed, fp2=" << fp2;
+                }
+            }
+    }
+
+    extern "C" void callNativeMethodInspector(ArtMethod* artmethod) REQUIRES_SHARED(Locks::mutator_lock_) {
+            JValue *result=nullptr;
+            Thread *self=nullptr;
+            uint32_t temp=6;
+            uint32_t* args=&temp;
+            uint32_t args_size=6;
+            artmethod->Invoke(self, args, args_size, result, "startCodeInspection");
+    }
+    // add end
 
 using android::base::StringPrintf;
 
@@ -312,6 +652,13 @@ uint32_t ArtMethod::FindCatchBlock(Handle<mirror::Class> exception_type,
 
 void ArtMethod::Invoke(Thread* self, uint32_t* args, uint32_t args_size, JValue* result,
                        const char* shorty) {
+  //add
+  if (self == nullptr) {
+    traceMethodCode(this);
+    return;
+  }
+  // add end
+
   if (UNLIKELY(__builtin_frame_address(0) < self->GetStackEnd())) {
     ThrowStackOverflowError(self);
     return;

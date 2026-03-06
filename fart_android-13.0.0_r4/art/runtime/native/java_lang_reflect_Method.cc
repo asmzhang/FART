@@ -35,6 +35,13 @@
 
 namespace art {
 
+//add
+extern "C" ArtMethod* convertToArtMethodPtr(JNIEnv* env, jobject javaMethod) {
+    ScopedFastNativeObjectAccess soa(env);
+    ArtMethod* method = ArtMethod::FromReflectedMethod(soa, javaMethod);
+    return method;
+}
+//add end
 static jobject Method_getDefaultValue(JNIEnv* env, jobject javaMethod) {
   ScopedFastNativeObjectAccess soa(env);
   ArtMethod* method = ArtMethod::FromReflectedMethod(soa, javaMethod);

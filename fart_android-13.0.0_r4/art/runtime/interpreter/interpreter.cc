@@ -36,6 +36,11 @@
 #include "unstarted_runtime.h"
 
 namespace art {
+
+    //add
+    extern "C" void traceDexExecution(ArtMethod* artmethod);
+    //add end
+
 namespace interpreter {
 
 ALWAYS_INLINE static ObjPtr<mirror::Object> ObjArg(uint32_t arg)
@@ -262,6 +267,12 @@ static inline JValue Execute(
     JValue result_register,
     bool stay_in_interpreter = false,
     bool from_deoptimize = false) REQUIRES_SHARED(Locks::mutator_lock_) {
+  //add
+  if(strstr(shadow_frame.GetMethod()->PrettyMethod().c_str(),"<clinit>") != nullptr) {
+    traceDexExecution(shadow_frame.GetMethod());
+  }
+  //add end
+
   DCHECK(!shadow_frame.GetMethod()->IsAbstract());
   DCHECK(!shadow_frame.GetMethod()->IsNative());
 

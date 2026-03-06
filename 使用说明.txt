@@ -1,0 +1,83 @@
+FART 脱壳使用方法
+工作原理
+刷入 FART ROM 后，脱壳由 ActivityThread 在应用启动时自动触发，通过读取配置文件 cyrus.config 来控制行为。
+
+第一步：推送配置文件
+在目标应用的私有目录创建配置文件：
+
+
+adb shell
+# 切换到 root
+su
+
+# 创建配置目录（如果目录不存在）
+mkdir -p /data/data/<目标包名>/
+
+# 写入配置文件
+cat > /data/data/<目标包名>/cyrus.config << 'EOF'
+dump=true
+sleep=10000
+EOF
+
+# 修正权限（让应用自身可读）
+chmod 777 /data/data/<目标包名>/cyrus.config
+配置项说明
+配置项	示例值	说明
+dump	true	是否启用脱壳，必须设为 true
+sleep	10000	启动后延迟多少毫秒再脱壳（建议 5000~30000，等待壳解密完成）
+force	com.example.*	只主动调用匹配的类（支持 * 通配符，逗号分隔）
+ignore	com.example.stub.*	跳过匹配的类，其余全部主动调用
+
+示例（精确控制）：
+
+dump=true
+sleep=15000
+force=com.target.app.*,com.target.lib.*
+
+示例（排除不需要的类）：
+
+dump=true
+sleep=10000
+ignore=com.android.*,androidx.*,kotlin.*
+第二步：启动目标应用
+
+# 方式一：直接启动
+adb shell am start -n <包名>/<主Activity>
+
+# 方式二：手动点击图标启动
+第三步：等待脱壳完成
+通过 logcat 监控进度：
+
+
+adb logcat -s ActivityThread:E | grep -E "sleep|Inspection"
+关键日志顺序：
+
+start sleep......10000 → 开始休眠等待
+sleep over and start startCodeInspection → 开始主动调用
+startCodeInspection run over → 脱壳结束
+第四步：提取 dex 文件
+
+adb pull /data/data/<目标包名>/  ./dump_output/
+dex 文件默认输出到应用私有目录，按需查找 .dex 后缀文件。
+
+注意事项
+sleep 时间需根据壳的解密速度调整，太短会导致壳未完全解密就开始 dump
+不写 force 也不写 ignore 时，默认对所有类主动调用
+force 和 ignore 同时存在时，force 优先（见 Cyrus.java:112）
+
+
+
+AOSP API检查机制 (metalava) 在阻止你往 android.app 里新增公开API。
+核心原因只有一句话：
+你新增了 android.app.Cyrus，AOSP认为你修改了系统公开API。
+所以它要求：
+frameworks/base/core/api/current.txt
+必须同步更新，否则 编译直接失败。
+
+不要把类放在
+android.app
+这是 公开SDK API空间
+
+直接关掉 API 检查。
+export WITHOUT_CHECK_API=true
+m
