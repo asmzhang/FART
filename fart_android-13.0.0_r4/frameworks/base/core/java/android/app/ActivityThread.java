@@ -8112,7 +8112,28 @@ public final class ActivityThread extends ClientTransactionHandler
         return resultClassloader;
     }
 
+    // private static final String[] SYSTEM_CLASS_PREFIXES = {
+    //     "java.", "javax.", "sun.", "com.sun.",
+    //     "android.", "com.android.", "dalvik.", "libcore.",
+    //     "kotlin.", "kotlinx.",
+    //     "androidx.arch.", "androidx.lifecycle.",    // 纯库，非业务
+    //     "junit.", "org.junit.",
+    // };
+
+    // private static boolean isSystemClass(String className) {
+    //     for (String prefix : SYSTEM_CLASS_PREFIXES) {
+    //         if (className.startsWith(prefix)) return true;
+    //     }
+    //     return false;
+    // }
+
     public static void dispatchClassTask(ClassLoader appClassloader, String eachclassname, Method dumpMethodCode_method) {
+        // // 新增：系统类前缀过滤
+        // if (isSystemClass(eachclassname)) {
+        //     Log.v("ActivityThread", "[sys-skip] " + eachclassname);
+        //     return;
+        // }
+        
         boolean shouldForceCall = Cyrus.shouldForceCall(eachclassname);
         Log.i("ActivityThread", (shouldForceCall ? "[load]" : "[skip]") + " dispatchClassTask: " + eachclassname);
 
@@ -8202,6 +8223,49 @@ public final class ActivityThread extends ClientTransactionHandler
         }
     }
 
+    // // 检查 DEX 文件是否来自 App 自身，而非系统目录
+    // private static boolean isDexFromApp(Object dexFile) {
+    //     try {
+    //         // 获取 DexFile 的 mFileName 字段
+    //         Field nameField = dexFile.getClass().getDeclaredField("mFileName");
+    //         nameField.setAccessible(true);
+    //         String fileName = (String) nameField.get(dexFile);
+    //         if (fileName == null) return true;
+    //         // 系统 DEX 在 /system/ /apex/ /vendor/ 下
+    //         return !fileName.startsWith("/system/") &&
+    //             !fileName.startsWith("/apex/") &&
+    //             !fileName.startsWith("/vendor/") &&
+    //             !fileName.startsWith("/product/");
+    //     } catch (Exception e) {
+    //         return true;
+    //     }
+    // }
+
+    private static boolean isUserDex(Object dexFile) {
+        try {
+             // 获取 DexFile 的 mFileName 字段
+            Field nameField = dexFile.getClass().getDeclaredField("mFileName");
+            nameField.setAccessible(true);
+            String fileName = (String) nameField.get(dexFile);
+
+            // 内存加载 dex 认为是用户 dex
+            if (fileName == null) return true;
+
+            // 用户可操作路径判断
+            if (fileName.startsWith("/data/app/")) return true;
+            if (fileName.startsWith("/data/priv-app/")) return true;
+            if (fileName.startsWith("/data/local/tmp/")) return true;
+            if (fileName.startsWith("/data/data/")) return true; // 应用私有目录（cache/code_cache）
+            if (fileName.startsWith("/sdcard/")) return true;
+            if (fileName.startsWith("/storage/emulated/0/")) return true;
+
+            return false;
+        } catch (Exception e) {
+            Log.w("ActivityThread", "DexFile path check failed", e);
+            return false;
+        }
+    }
+
     public static void startCodeInspectionWithCL(ClassLoader appClassloader) {
         List<Object> dexFilesArray = new ArrayList<Object>();
         Field pathList_Field = (Field) resolveDeclaredField(appClassloader, "dalvik.system.BaseDexClassLoader", "pathList");
@@ -8262,6 +8326,13 @@ public final class ActivityThread extends ClientTransactionHandler
                 Log.e("ActivityThread", "dexfile is null");
                 continue;
             }
+
+            // 新增：过滤系统 DEX
+            if (!isUserDex(dexfile)) {
+                Log.i("ActivityThread", "[dex-skip] system dex, skip");
+                continue;
+            }
+
             if (dexfile != null) {
                 dexFilesArray.add(dexfile);
                 Object mcookie = extractFieldValue(appClassloader, "dalvik.system.DexFile", dexfile, "mCookie");
@@ -8316,6 +8387,10 @@ public final class ActivityThread extends ClientTransactionHandler
                         e.printStackTrace();
                     }
 
+                    // 休眠结束后，壳已完成初始化，此时枚举已加载类找到真实 Application
+                    String realAppClass = findRealApplicationClassName(context);
+                    writeRealAppClassToFile(context, realAppClass);
+
                     // 通知 native 层 fix 模式开关
                     try {
                         Class<?> dexFileClazz = Class.forName("dalvik.system.DexFile");
@@ -8346,6 +8421,113 @@ public final class ActivityThread extends ClientTransactionHandler
                 }
             }
         }).start();
+    }
+    /**
+     * 通过枚举已加载的类，找到真实的 Application 子类（壳之前的原始应用入口）。
+     *
+     * 核心逻辑：
+     * 1. 从 PathClassLoader → DexPathList → dexElements 枚举所有 DEX 内的类名
+     * 2. 对每个类名调用 ClassLoader.findLoadedClass()（不触发类加载/初始化）
+     * 3. 筛选出 android.app.Application 的子类，且排除当前壳 Application 自身
+     *
+     * 为何使用 findLoadedClass 而非 Class.forName：
+     * - Class.forName 会触发 <clinit>，可能导致壳的二次初始化或崩溃
+     * - findLoadedClass 只查询已在内存中的类，安全且轻量
+     *
+     * @param context 应用 Context
+     * @return 真实 Application 类的全限定名，找不到则返回 null
+     */
+    private static String findRealApplicationClassName(Context context) {
+        try {
+            ClassLoader cl = context.getClassLoader();
+            Class<?> appClass = android.app.Application.class;
+            String currentAppClass = context.getClass().getName();
+
+            // 通过 BaseDexClassLoader.pathList 拿到 DexPathList
+            Class<?> baseDexClazz = Class.forName("dalvik.system.BaseDexClassLoader");
+            java.lang.reflect.Field pathListField = baseDexClazz.getDeclaredField("pathList");
+            pathListField.setAccessible(true);
+            Object pathList = pathListField.get(cl);
+
+            // DexPathList.dexElements
+            java.lang.reflect.Field dexElementsField = pathList.getClass().getDeclaredField("dexElements");
+            dexElementsField.setAccessible(true);
+            Object[] dexElements = (Object[]) dexElementsField.get(pathList);
+
+            // ClassLoader.findLoadedClass() 是 protected 方法，通过反射调用
+            java.lang.reflect.Method findLoadedClassMethod =
+                    ClassLoader.class.getDeclaredMethod("findLoadedClass", String.class);
+            findLoadedClassMethod.setAccessible(true);
+
+            List<String> candidates = new ArrayList<>();
+
+            for (Object element : dexElements) {
+                // Element.dexFile
+                java.lang.reflect.Field dexFileField;
+                try {
+                    dexFileField = element.getClass().getDeclaredField("dexFile");
+                } catch (NoSuchFieldException e) {
+                    continue;
+                }
+                dexFileField.setAccessible(true);
+                Object dexFile = dexFileField.get(element);
+                if (dexFile == null) continue;
+
+                // DexFile.entries() → Enumeration<String>（斜杠格式类名）
+                java.lang.reflect.Method entriesMethod =
+                        dexFile.getClass().getDeclaredMethod("entries");
+                entriesMethod.setAccessible(true);
+                @SuppressWarnings("unchecked")
+                java.util.Enumeration<String> classNames =
+                        (java.util.Enumeration<String>) entriesMethod.invoke(dexFile);
+
+                while (classNames.hasMoreElements()) {
+                    String slashName = classNames.nextElement();
+                    String dotName = slashName.replace('/', '.');
+
+                    // 只检查已加载到内存中的类，不触发新的类加载
+                    Class<?> klass = (Class<?>) findLoadedClassMethod.invoke(cl, dotName);
+                    if (klass == null) continue;
+
+                    // 是 Application 子类，且排除 Application 本身和当前壳 Application
+                    if (appClass.isAssignableFrom(klass)
+                            && !klass.equals(appClass)
+                            && !klass.getName().equals(currentAppClass)) {
+                        candidates.add(klass.getName());
+                    }
+                }
+            }
+
+            if (!candidates.isEmpty()) {
+                Log.e("ActivityThread", "[FART] real app class candidates: " + candidates);
+                return candidates.get(0);
+            }
+
+        } catch (Exception e) {
+            Log.e("ActivityThread", "[FART] findRealApplicationClassName failed: " + e.getMessage());
+        }
+        return null;
+    }
+
+    /**
+     * 将真实 Application 类名写入 /data/data/{pkg}/cyrus/real_app_class.txt
+     *
+     * @param context   应用 Context
+     * @param className findRealApplicationClassName() 返回的类名
+     */
+    private static void writeRealAppClassToFile(Context context, String className) {
+        if (className == null) return;
+        try {
+            String dir = "/data/data/" + context.getPackageName() + "/cyrus";
+            new java.io.File(dir).mkdirs();
+            java.io.File out = new java.io.File(dir + "/real_app_class.txt");
+            try (java.io.FileWriter fw = new java.io.FileWriter(out)) {
+                fw.write(className);
+            }
+            Log.e("ActivityThread", "[FART] real_app_class.txt written: " + className);
+        } catch (Exception e) {
+            Log.e("ActivityThread", "[FART] writeRealAppClassToFile failed: " + e.getMessage());
+        }
     }
     //add end
 }
