@@ -8387,8 +8387,8 @@ public final class ActivityThread extends ClientTransactionHandler
                         e.printStackTrace();
                     }
 
-                    // 休眠结束后，壳已完成初始化，此时枚举已加载类找到真实 Application
-                    String realAppClass = findRealApplicationClassName(context);
+                    // 休眠结束后，真实 Application
+                    String realAppClass = findRealApplicationClassName();
                     writeRealAppClassToFile(context, realAppClass);
 
                     // 通知 native 层 fix 模式开关
@@ -8422,111 +8422,74 @@ public final class ActivityThread extends ClientTransactionHandler
             }
         }).start();
     }
-    /**
-     * 通过枚举已加载的类，找到真实的 Application 子类（壳之前的原始应用入口）。
-     *
-     * 核心逻辑：
-     * 1. 从 PathClassLoader → DexPathList → dexElements 枚举所有 DEX 内的类名
-     * 2. 对每个类名调用 ClassLoader.findLoadedClass()（不触发类加载/初始化）
-     * 3. 筛选出 android.app.Application 的子类，且排除当前壳 Application 自身
-     *
-     * 为何使用 findLoadedClass 而非 Class.forName：
-     * - Class.forName 会触发 <clinit>，可能导致壳的二次初始化或崩溃
-     * - findLoadedClass 只查询已在内存中的类，安全且轻量
-     *
-     * @param context 应用 Context
-     * @return 真实 Application 类的全限定名，找不到则返回 null
-     */
-    private static String findRealApplicationClassName(Context context) {
+
+    private static String findRealApplicationClassName() {
         try {
-            ClassLoader cl = context.getClassLoader();
-            Class<?> appClass = android.app.Application.class;
-            String currentAppClass = context.getClass().getName();
 
-            // 通过 BaseDexClassLoader.pathList 拿到 DexPathList
-            Class<?> baseDexClazz = Class.forName("dalvik.system.BaseDexClassLoader");
-            java.lang.reflect.Field pathListField = baseDexClazz.getDeclaredField("pathList");
-            pathListField.setAccessible(true);
-            Object pathList = pathListField.get(cl);
+            ActivityThread at = ActivityThread.currentActivityThread();
 
-            // DexPathList.dexElements
-            java.lang.reflect.Field dexElementsField = pathList.getClass().getDeclaredField("dexElements");
-            dexElementsField.setAccessible(true);
-            Object[] dexElements = (Object[]) dexElementsField.get(pathList);
-
-            // ClassLoader.findLoadedClass() 是 protected 方法，通过反射调用
-            java.lang.reflect.Method findLoadedClassMethod =
-                    ClassLoader.class.getDeclaredMethod("findLoadedClass", String.class);
-            findLoadedClassMethod.setAccessible(true);
-
-            List<String> candidates = new ArrayList<>();
-
-            for (Object element : dexElements) {
-                // Element.dexFile
-                java.lang.reflect.Field dexFileField;
-                try {
-                    dexFileField = element.getClass().getDeclaredField("dexFile");
-                } catch (NoSuchFieldException e) {
-                    continue;
-                }
-                dexFileField.setAccessible(true);
-                Object dexFile = dexFileField.get(element);
-                if (dexFile == null) continue;
-
-                // DexFile.entries() → Enumeration<String>（斜杠格式类名）
-                java.lang.reflect.Method entriesMethod =
-                        dexFile.getClass().getDeclaredMethod("entries");
-                entriesMethod.setAccessible(true);
-                @SuppressWarnings("unchecked")
-                java.util.Enumeration<String> classNames =
-                        (java.util.Enumeration<String>) entriesMethod.invoke(dexFile);
-
-                while (classNames.hasMoreElements()) {
-                    String slashName = classNames.nextElement();
-                    String dotName = slashName.replace('/', '.');
-
-                    // 只检查已加载到内存中的类，不触发新的类加载
-                    Class<?> klass = (Class<?>) findLoadedClassMethod.invoke(cl, dotName);
-                    if (klass == null) continue;
-
-                    // 是 Application 子类，且排除 Application 本身和当前壳 Application
-                    if (appClass.isAssignableFrom(klass)
-                            && !klass.equals(appClass)
-                            && !klass.getName().equals(currentAppClass)) {
-                        candidates.add(klass.getName());
-                    }
-                }
+            if (at == null) {
+                Log.e("ActivityThread", "[FART] ActivityThread null");
+                return null;
             }
 
-            if (!candidates.isEmpty()) {
-                Log.e("ActivityThread", "[FART] real app class candidates: " + candidates);
-                return candidates.get(0);
+            Application app = at.mInitialApplication;
+
+            if (app == null) {
+                Log.e("ActivityThread", "[FART] mInitialApplication null");
+                return null;
             }
 
-        } catch (Exception e) {
-            Log.e("ActivityThread", "[FART] findRealApplicationClassName failed: " + e.getMessage());
+            String name = app.getClass().getName();
+
+            Log.e("ActivityThread", "[FART] real Application -> " + name);
+
+            return name;
+
+        } catch (Throwable e) {
+
+            Log.e("ActivityThread", "[FART] error " + e);
+
         }
+
         return null;
     }
 
     /**
      * 将真实 Application 类名写入 /data/data/{pkg}/cyrus/real_app_class.txt
-     *
-     * @param context   应用 Context
-     * @param className findRealApplicationClassName() 返回的类名
+     * 写入前先删除旧目录再创建
      */
     private static void writeRealAppClassToFile(Context context, String className) {
         if (className == null) return;
+
         try {
-            String dir = "/data/data/" + context.getPackageName() + "/cyrus";
-            new java.io.File(dir).mkdirs();
-            java.io.File out = new java.io.File(dir + "/real_app_class.txt");
+
+            String dirPath = context.getDataDir() + "/cyrus";
+            java.io.File dir = new java.io.File(dirPath);
+
+            // 目录存在先删除
+            if (dir.exists()) {
+                deleteRecursive(dir);
+            }
+
+            // 重新创建目录
+            if (!dir.mkdirs()) {
+                Log.e("ActivityThread", "[FART] mkdirs failed: " + dirPath);
+                return;
+            }
+
+            java.io.File out = new java.io.File(dir, "real_app_class.txt");
+
             try (java.io.FileWriter fw = new java.io.FileWriter(out)) {
                 fw.write(className);
             }
+
             Log.e("ActivityThread", "[FART] real_app_class.txt written: " + className);
-        } catch (Exception e) {
-            Log.e("ActivityThread", "[FART] writeRealAppClassToFile failed: " + e.getMessage());
+
+        } catch (Throwable e) {
+
+            Log.e("ActivityThread", "[FART] writeRealAppClassToFile failed: " + e);
+
         }
     }
     //add end
