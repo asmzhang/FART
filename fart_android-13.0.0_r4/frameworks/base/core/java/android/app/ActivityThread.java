@@ -8493,7 +8493,7 @@ public final class ActivityThread extends ClientTransactionHandler
     }
 
     /**
-     * 将真实 Application 类名写入 /data/data/{pkg}/cyrus/real_app_class.txt
+     * 将真实 Application 类名写入 /data/data/{pkg}/cyrus_{pkg}/real_app_class.txt
      * 写入前先删除旧目录再创建
      */
     private static void writeRealAppClassToFile(Context context, String className) {
@@ -8501,7 +8501,9 @@ public final class ActivityThread extends ClientTransactionHandler
 
         try {
 
-            String dirPath = context.getDataDir() + "/cyrus";
+            String pkg = context.getPackageName();
+
+            String dirPath = context.getDataDir() + "/cyrus_" + pkg;
             java.io.File dir = new java.io.File(dirPath);
 
             // 目录存在先删除

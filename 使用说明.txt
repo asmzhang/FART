@@ -40,6 +40,7 @@ dump=true
 sleep=10000
 ignore=com.android.*,androidx.*,kotlin.*
 ignore=com.luoye.dpt.junkcode.*
+is_fix=true
 第二步：启动目标应用
 
 # 方式一：直接启动

@@ -206,10 +206,10 @@ namespace art {
             size_t size_ = dex_file->Size();
             int size_int = static_cast<int>(size_);
 
-            // 创建目录：/data/data/<packageName>/cyrus
+            // 创建目录：/data/data/<packageName>/cyrus_packageName
             std::string base_dir = "/data/data/";
             std::string app_dir = base_dir + szProcName;
-            std::string cyrus_dir = app_dir + "/cyrus";
+            std::string cyrus_dir = app_dir + "/cyrus_" + szProcName;
 
             ensure_dir_exists(app_dir);
             ensure_dir_exists(cyrus_dir);
@@ -310,10 +310,10 @@ namespace art {
             size_t size_ = dex_file->Size();
             int size_int = static_cast<int>(size_);
 
-            // 创建目录：/data/data/<packageName>/cyrus
+            // 创建目录：/data/data/<packageName>/cyrus_packageName
             std::string base_dir = "/data/data/";
             std::string app_dir = base_dir + szProcName;
-            std::string cyrus_dir = app_dir + "/cyrus";
+            std::string cyrus_dir = app_dir + "/cyrus_" + szProcName;
             std::string fix_dir = cyrus_dir + "/fix";
 
             ensure_dir_exists(app_dir);
@@ -491,7 +491,7 @@ namespace art {
 
 
 
-        std::string cyrus_dir = std::string("/data/data/") + szProcName + "/cyrus";
+        std::string cyrus_dir = std::string("/data/data/") + szProcName + "/cyrus_" + szProcName;
         std::string fix_dir = cyrus_dir + "/fix";
 
         // 在锁内拷贝需要写出的数据，避免持锁期间做文件 I/O
