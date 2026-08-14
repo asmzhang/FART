@@ -2,6 +2,11 @@ FART 脱壳使用方法
 工作原理
 刷入 FART ROM 后，脱壳由 ActivityThread 在应用启动时自动触发，通过读取配置文件 cyrus.config 来控制行为。
 
+本地补丁树（按 Android 版本）：
+  fart6 / fart8 / fart10 / fart_android-13.0.0_r4
+均为「已改文件」overlay，缺基线时可从对应 AOSP tag 拉单文件再叠补丁。
+日常用法见本文；android-13 的 <clinit> 行为见文末专节。
+
 第一步：推送配置文件
 在目标应用的私有目录创建配置文件：
 
@@ -27,6 +32,7 @@ dump	true	是否启用脱壳，必须设为 true
 sleep	10000	启动后延迟多少毫秒再脱壳（建议 5000~30000，等待壳解密完成）
 force	com.example.*	只主动调用匹配的类（支持 * 通配符，逗号分隔）
 ignore	com.example.stub.*	跳过匹配的类，其余全部主动调用
+is_fix	true	将捕获到的 CodeItem 回写到内存缓冲区，结束时写出 *_dex_file_fix.dex
 
 示例（精确控制）：
 
@@ -34,7 +40,7 @@ dump=true
 sleep=15000
 force=com.target.app.*,com.target.lib.*
 
-示例（排除不需要的类）：
+示例（排除不需要的类 + 内存修复）：
 
 dump=true
 sleep=10000
@@ -60,15 +66,104 @@ startCodeInspection run over → 脱壳结束
 第四步：提取 dex 文件
 
 adb pull /data/data/<目标包名>/  ./dump_output/
-dex 文件默认输出到应用私有目录，按需查找 .dex 后缀文件。
+产物一般在 /data/data/<包名>/cyrus_<包名>/ ：
+  dex_manifest.json       槽位/kind/location/checksum/pkg_match/inmemory
+  loaders_<phase>.txt     发现到的 ClassLoader
+  inspect_fail.txt        主动调用失败（VerifyError 等），不影响已 dump 的 DEX
+  primary/ extra/ custom/ inmemory/ auto/
+                          按来源区分；Java 登记时会再写一份到对应 kind 目录（与 manifest 对齐）
+  *_dex_file.dex          兼容旧脚本的扁平副本（全量）
+  *_ins_*.bin             兼容旧脚本的扁平 CodeItem
+  *_class_list.txt        该类 DEX 的类名
+  fix/<kind>/             is_fix 回写，同样有扁平副本
+
+怎么分（人看，不自动丢）
+  系统          不产出（/system /apex /vendor /dalvik-cache 等）
+  app 原包      primary/，location 带 base.apk!classes*.dex，pkg_match=true
+  split         extra/，location 带 split_*.apk
+  壳            看 loaders 类名、location、class_list；仍完整 dump
+  app 加密/解密  同一槽位 ins/fix 是还原体；新出现的 inmemory/ 常是解密后的副本
+  自定义加载    custom/，无 pathList 的 CL 字段收获
+  动态加载      extra/ 或 inmemory/，location 为 files/*.dex 或空路径
+  compact/cdex  manifest.compact=true
+
+模块
+  Cyrus.java     配置
+  CyrusDump.java ClassLoader 发现（含自定义）、登记、巡检；ActivityThread 只挂钩
+  自定义 ClassLoader：无 pathList 时递归收获 DexFile/cookie/嵌套 CL，不 NPE
+
+配置补充
+  scan_parents=false     默认不扫父链（framework）
+  extra_loaders=true     扫 split / ApplicationLoaders / 线程 CCL / 自定义字段里的 CL
+
 
 注意事项
 sleep 时间需根据壳的解密速度调整，太短会导致壳未完全解密就开始 dump
 不写 force 也不写 ignore 时，默认对所有类主动调用
-force 和 ignore 同时存在时，force 优先（见 Cyrus.java:112）
+force 和 ignore 同时存在时，force 优先（见 Cyrus.java）
+反射主动调用拿不到 <clinit>，类初始化体依赖 Execute 钩子（见下节）
 
 
+------------------------------------------------------------
+android-13.0.0_r4：<clinit> CodeItem 捕获（本地补丁）
+------------------------------------------------------------
 
+背景
+  旧逻辑在 Execute 入口对 <clinit> 只调 traceDexExecution：整包 DEX 按 begin
+  地址 dump 一次，不写 *_ins_*.bin。Virbox 等壳常在解释执行窗口才解开 body，
+  主动调用又反射不到 <clinit>，导致残留几乎全是类初始化方法。
+
+改动约定
+  只改 overlay 里已有 FART 插入点，AOSP 正文不改。新增代码一律用 //add ... //add end 包住。
+
+改动文件（仅 overlay，不必整树；基线漂移时从 AOSP 拉单文件）
+  fart_android-13.0.0_r4/art/runtime/interpreter/interpreter.cc
+  fart_android-13.0.0_r4/art/runtime/art_method.cc
+  fart_android-13.0.0_r4/art/runtime/native/dalvik_system_DexFile.cc
+  fart_android-13.0.0_r4/libcore/.../DexFile.java
+  fart_android-13.0.0_r4/frameworks/.../ActivityThread.java
+  fart_android-13.0.0_r4/frameworks/.../CyrusDump.java
+  fart_android-13.0.0_r4/frameworks/.../Cyrus.java
+
+  AOSP 单文件基线（tag android-13.0.0_r4）：
+  https://android.googlesource.com/platform/art/+/refs/tags/android-13.0.0_r4/runtime/interpreter/interpreter.cc
+  https://android.googlesource.com/platform/art/+/refs/tags/android-13.0.0_r4/runtime/art_method.cc
+
+行为
+  1. Execute 入口：IsClassInitializer() 为真时调用 traceMethodCode
+     （禁止 PrettyMethod()+strstr；热路径不写整包 DEX，只写合法 CodeItem）
+  2. 整包 DEX 由 Java 登记 / flushManifest 在 JNI 线程写出（kind 目录 + 扁平副本）
+  3. traceMethodCode：按 (dex_begin, method_idx) 去重后追加写 *_ins_*.bin；
+     is_fix 缓冲区在 nativeSetFixEnabled 时按 owned DEX 预填，热路径只 memcpy CodeItem
+  4. 仅对 <clinit>：若像占位体（insns≤1 或 code_item_len≤18，常见 return-void）
+     则不写、不进集，避免把假窗口锁死；普通主动调用路径不受影响
+  5. CodeItem 追加路径不做 fsync；越界/损坏 handler 的 CodeItem 丢弃不写
+
+编译 / 刷机
+  将上述两文件覆盖进完整 AOSP/Lineage 树对应路径后重编 ART（或含 libart 的
+  runtime apex），刷入设备。编译刷机成本高，建议先用 Frida 验证：类首次加载时
+  GetCodeItem/Execute 入口是否已是非占位明文，再决定刷 ROM。
+
+  export WITHOUT_CHECK_API=true   # 若仍带 android.app.Cyrus
+  # 再按设备树正常 brunch / m
+
+刷机后验证
+  # 清旧产物再跑目标包
+  rm -rf /data/data/<包名>/cyrus_*
+  # 跑完后：
+  grep "<clinit>" /data/data/<包名>/cyrus_*/*_ins_*.bin
+  # 记录里 code_item_len 应明显大于 18；仍为 0 说明窗口不对或类未加载
+
+限制（刷机也解不了）
+  - 只捕获实际跑过的 <clinit>；未加载类需 Class.forName / 业务路径触发
+  - 若解密发生在解释若干指令之后，入口 dump 仍空，需改钩点
+  - oat/JIT 不进解释器则无此钩子，必要时 -Xint / force interpreter
+  - traceDexExecution 仍保留但 Execute 不再调用（死代码，可留可删）
+
+
+------------------------------------------------------------
+AOSP API 检查（metalava）
+------------------------------------------------------------
 AOSP API检查机制 (metalava) 在阻止你往 android.app 里新增公开API。
 核心原因只有一句话：
 你新增了 android.app.Cyrus，AOSP认为你修改了系统公开API。

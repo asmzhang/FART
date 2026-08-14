@@ -8094,22 +8094,45 @@ public final class ActivityThread extends ClientTransactionHandler
 
     }
 
+    //add
+    private static void registerOwnedAppDexes(String phase) {
+        CyrusDump.registerAll(phase);
+    }
+    //add end
+
     public static ClassLoader obtainAppClassLoader() {
-        ClassLoader resultClassloader = null;
-        Object currentActivityThread = invokeStaticByName(
-                "android.app.ActivityThread", "currentActivityThread",
-                new Class[]{}, new Object[]{});
-        Object mBoundApplication = getInstanceFieldValue(
-                "android.app.ActivityThread", currentActivityThread,
-                "mBoundApplication");
-        Application mInitialApplication = (Application) getInstanceFieldValue("android.app.ActivityThread",
-                currentActivityThread, "mInitialApplication");
-        Object loadedApkInfo = getInstanceFieldValue(
-                "android.app.ActivityThread$AppBindData",
-                mBoundApplication, "info");
-        Application mApplication = (Application) getInstanceFieldValue("android.app.LoadedApk", loadedApkInfo, "mApplication");
-        resultClassloader = mApplication.getClassLoader();
-        return resultClassloader;
+        try {
+            Object currentActivityThread = invokeStaticByName(
+                    "android.app.ActivityThread", "currentActivityThread",
+                    new Class[]{}, new Object[]{});
+            if (currentActivityThread == null) {
+                return null;
+            }
+            Object mBoundApplication = getInstanceFieldValue(
+                    "android.app.ActivityThread", currentActivityThread,
+                    "mBoundApplication");
+            Application mInitialApplication = (Application) getInstanceFieldValue(
+                    "android.app.ActivityThread",
+                    currentActivityThread, "mInitialApplication");
+            if (mBoundApplication != null) {
+                Object loadedApkInfo = getInstanceFieldValue(
+                        "android.app.ActivityThread$AppBindData",
+                        mBoundApplication, "info");
+                if (loadedApkInfo != null) {
+                    Application mApplication = (Application) getInstanceFieldValue(
+                            "android.app.LoadedApk", loadedApkInfo, "mApplication");
+                    if (mApplication != null) {
+                        return mApplication.getClassLoader();
+                    }
+                }
+            }
+            if (mInitialApplication != null) {
+                return mInitialApplication.getClassLoader();
+            }
+        } catch (Throwable t) {
+            Log.w("ActivityThread", "obtainAppClassLoader failed: " + t);
+        }
+        return null;
     }
 
     // private static final String[] SYSTEM_CLASS_PREFIXES = {
@@ -8206,21 +8229,9 @@ public final class ActivityThread extends ClientTransactionHandler
     }
 
     public static void startCodeInspection() {
-        ClassLoader appClassloader = obtainAppClassLoader();
-        ClassLoader tmpClassloader=appClassloader;
-        ClassLoader parentClassloader=appClassloader.getParent();
-        if(appClassloader.toString().indexOf("java.lang.BootClassLoader")==-1)
-        {
-            startCodeInspectionWithCL(appClassloader);
-        }
-        while(parentClassloader!=null){
-            if(parentClassloader.toString().indexOf("java.lang.BootClassLoader")==-1)
-            {
-                startCodeInspectionWithCL(parentClassloader);
-            }
-            tmpClassloader=parentClassloader;
-            parentClassloader=parentClassloader.getParent();
-        }
+        //add
+        CyrusDump.inspectAll();
+        //add end
     }
 
     // // 检查 DEX 文件是否来自 App 自身，而非系统目录
@@ -8242,149 +8253,15 @@ public final class ActivityThread extends ClientTransactionHandler
     // }
 
     private static boolean isUserDex(Object dexFile) {
-        try {
-             // 获取 DexFile 的 mFileName 字段
-            Field nameField = dexFile.getClass().getDeclaredField("mFileName");
-            nameField.setAccessible(true);
-            String fileName = (String) nameField.get(dexFile);
-
-            // 内存加载 dex 认为是用户 dex
-            if (fileName == null) return true;
-
-            // 用户可操作路径判断
-            // dalvik.system.PathClassLoader[
-            //     DexPathList[
-            //         [
-            //             zip file "/data/app/~~tIm1tO5Ipzl4bGAKKLmzEQ==/com.asmzhang.testapp-Oe27OKKjcqmG8cwK--mosQ==/base.apk",
-            //             zip file "/data/user/0/com.asmzhang.testapp/code_cache/i11111i111.zip"
-            //         ],
-            //     nativeLibraryDirectories=
-            //     [
-            //         /data/app/~~tIm1tO5Ipzl4bGAKKLmzEQ==/com.asmzhang.testapp-Oe27OKKjcqmG8cwK--mosQ==/lib/arm64,
-            //          /data/app/~~tIm1tO5Ipzl4bGAKKLmzEQ==/com.asmzhang.testapp-Oe27OKKjcqmG8cwK--mosQ==/base.apk!/lib/arm64-v8a,
-            //           /system/lib64, /system_ext/lib64
-            //     ]
-            // ]]
-
-            //apk原始路径
-            if (fileName.startsWith("/data/app/")) return true;
-
-            if (fileName.startsWith("/data/priv-app/")) return true;
-            if (fileName.startsWith("/data/local/tmp/")) return true;
-            // /data/user/0/=/data/data/ 是缓存
-            if (fileName.startsWith("/data/user/0/")) return true; 
-            if (fileName.startsWith("/data/data/")) return true;
-            // /sdcard/=/storage/emulated/0/
-            if (fileName.startsWith("/sdcard/")) return true;
-            if (fileName.startsWith("/storage/emulated/0/")) return true;
-
-            return false;
-        } catch (Exception e) {
-            Log.w("ActivityThread", "DexFile path check failed", e);
-            return false;
-        }
+        //add
+        return CyrusDump.isUserDex(dexFile);
+        //add end
     }
 
     public static void startCodeInspectionWithCL(ClassLoader appClassloader) {
-        List<Object> dexFilesArray = new ArrayList<Object>();
-        Field pathList_Field = (Field) resolveDeclaredField(appClassloader, "dalvik.system.BaseDexClassLoader", "pathList");
-        Object pathList_object = getInstanceFieldValue("dalvik.system.BaseDexClassLoader", appClassloader, "pathList");
-        Object[] ElementsArray = (Object[]) getInstanceFieldValue("dalvik.system.DexPathList", pathList_object, "dexElements");
-        Field dexFile_fileField = null;
-        try {
-            dexFile_fileField = (Field) resolveDeclaredField(appClassloader, "dalvik.system.DexPathList$Element", "dexFile");
-        } catch (Exception e) {
-            e.printStackTrace();
-        } catch (Error e) {
-            e.printStackTrace();
-        }
-        Class DexFileClazz = null;
-        try {
-            DexFileClazz = appClassloader.loadClass("dalvik.system.DexFile");
-        } catch (Exception e) {
-            e.printStackTrace();
-        } catch (Error e) {
-            e.printStackTrace();
-        }
-        Method getClassNameList_method = null;
-        Method defineClass_method = null;
-        Method dumpDexFile_method = null;
-        Method dumpMethodCode_method = null;
-
-        for (Method field : DexFileClazz.getDeclaredMethods()) {
-            if (field.getName().equals("getClassNameList")) {
-                getClassNameList_method = field;
-                getClassNameList_method.setAccessible(true);
-            }
-            if (field.getName().equals("defineClassNative")) {
-                defineClass_method = field;
-                defineClass_method.setAccessible(true);
-            }
-            if (field.getName().equals("dumpDexFile")) {
-                dumpDexFile_method = field;
-                dumpDexFile_method.setAccessible(true);
-            }
-            if (field.getName().equals("nativeDumpCode")) {
-                dumpMethodCode_method = field;
-                dumpMethodCode_method.setAccessible(true);
-            }
-        }
-        Field mCookiefield = resolveDeclaredField(appClassloader, "dalvik.system.DexFile", "mCookie");
-        Log.v("ActivityThread->methods", "dalvik.system.DexPathList.ElementsArray.length:" + ElementsArray.length);
-        for (int j = 0; j < ElementsArray.length; j++) {
-            Object element = ElementsArray[j];
-            Object dexfile = null;
-            try {
-                dexfile = (Object) dexFile_fileField.get(element);
-            } catch (Exception e) {
-                e.printStackTrace();
-            } catch (Error e) {
-                e.printStackTrace();
-            }
-            if (dexfile == null) {
-                Log.e("ActivityThread", "dexfile is null");
-                continue;
-            }
-
-            // 新增：过滤系统 DEX
-            if (!isUserDex(dexfile)) {
-                Log.i("ActivityThread", "[dex-skip] system dex, skip");
-                continue;
-            }
-
-            if (dexfile != null) {
-                dexFilesArray.add(dexfile);
-                Object mcookie = extractFieldValue(appClassloader, "dalvik.system.DexFile", dexfile, "mCookie");
-                if (mcookie == null) {
-                    Object mInternalCookie = extractFieldValue(appClassloader, "dalvik.system.DexFile", dexfile, "mInternalCookie");
-                    if(mInternalCookie!=null)
-                    {
-                        mcookie=mInternalCookie;
-                    }else{
-                        Log.v("ActivityThread->err", "get mInternalCookie is null");
-                        continue;
-                    }
-
-                }
-                String[] classnames = null;
-                try {
-                    classnames = (String[]) getClassNameList_method.invoke(dexfile, mcookie);
-                } catch (Exception e) {
-                    e.printStackTrace();
-                    continue;
-                } catch (Error e) {
-                    e.printStackTrace();
-                    continue;
-                }
-                if (classnames != null) {
-                    for (String eachclassname : classnames) {
-                        dispatchClassTask(appClassloader, eachclassname, dumpMethodCode_method);
-                    }
-                }
-
-            }
-        }
-        return;
+        //add
+        CyrusDump.inspectClassLoader(appClassloader);
+        //add end
     }
 
     public static void launchInspectorThread(Context context) {
@@ -8398,6 +8275,11 @@ public final class ActivityThread extends ClientTransactionHandler
                 // 判断是否需要脱壳
                 if (Cyrus.isDumpEnabled()) {
 
+                    //add
+                    // 休眠前先登记应用 DEX 槽位，使 sleep 期间的 <clinit>/Execute 不再灌系统 DEX
+                    registerOwnedAppDexes("pre-sleep");
+                    //add end
+
                     // 休眠
                     try {
                         Log.e("ActivityThread", "start sleep......" + Cyrus.getSleepTimeMillis());
@@ -8410,33 +8292,36 @@ public final class ActivityThread extends ClientTransactionHandler
                     String realAppClass = findRealApplicationClassName();
                     writeRealAppClassToFile(context, realAppClass);
 
+                    //add
+                    // 壳可能在 sleep 窗口才挂上内存 DEX / 子 ClassLoader
+                    registerOwnedAppDexes("post-sleep");
+                    //add end
+
                     // 通知 native 层 fix 模式开关
-                    try {
-                        Class<?> dexFileClazz = Class.forName("dalvik.system.DexFile");
-                        java.lang.reflect.Method setFixMethod = dexFileClazz.getDeclaredMethod("nativeSetFixEnabled", boolean.class);
-                        setFixMethod.setAccessible(true);
-                        setFixMethod.invoke(null, Cyrus.isFixEnabled());
-                    } catch (Exception e) {
-                        Log.e("ActivityThread", "nativeSetFixEnabled failed: " + e.getMessage());
-                    }
+                    //add
+                    CyrusDump.setFixEnabled(Cyrus.isFixEnabled());
+                    //add end
 
                     // 开始脱壳
                     Log.e("ActivityThread", "sleep over and start startCodeInspection");
                     startCodeInspection();
                     Log.e("ActivityThread", "startCodeInspection run over");
 
+                    //add
+                    // 主动调用过程中新出现的加载器
+                    registerOwnedAppDexes("post-inspect");
+                    //add end
+
                     // fix 模式：扫描完成后将修复缓冲区写入磁盘
                     if (Cyrus.isFixEnabled()) {
-                        try {
-                            Class<?> dexFileClazz = Class.forName("dalvik.system.DexFile");
-                            java.lang.reflect.Method flushMethod = dexFileClazz.getDeclaredMethod("nativeFlushFixedDex");
-                            flushMethod.setAccessible(true);
-                            flushMethod.invoke(null);
-                            Log.e("ActivityThread", "nativeFlushFixedDex done");
-                        } catch (Exception e) {
-                            Log.e("ActivityThread", "nativeFlushFixedDex failed: " + e.getMessage());
-                        }
+                        //add
+                        CyrusDump.flushFixedDex();
+                        //add end
+                        Log.e("ActivityThread", "nativeFlushFixedDex done");
                     }
+                    //add
+                    CyrusDump.flushManifest();
+                    //add end
                 }
             }
         }).start();
@@ -8506,16 +8391,13 @@ public final class ActivityThread extends ClientTransactionHandler
             String dirPath = context.getDataDir() + "/cyrus_" + pkg;
             java.io.File dir = new java.io.File(dirPath);
 
-            // 目录存在先删除
-            if (dir.exists()) {
-                deleteRecursive(dir);
-            }
-
-            // 重新创建目录
-            if (!dir.mkdirs()) {
+            //add
+            // 不删已 dump 的 DEX/<clinit> 产物，只保证目录存在
+            if (!dir.exists() && !dir.mkdirs()) {
                 Log.e("ActivityThread", "[FART] mkdirs failed: " + dirPath);
                 return;
             }
+            //add end
 
             java.io.File out = new java.io.File(dir, "real_app_class.txt");
 

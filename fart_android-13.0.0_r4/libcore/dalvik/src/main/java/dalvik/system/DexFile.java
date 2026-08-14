@@ -724,5 +724,12 @@ public final class DexFile {
     static native void nativeSetFixEnabled(boolean enabled);
     /** 将所有已修复的DEX缓冲区写入 *_dex_file_fix.dex 文件 */
     static native void nativeFlushFixedDex();
+    /**
+     * 将 cookie 内的 DexFile* 登记为应用 DEX，按 startIndex 起赋槽位（APK 多 DEX 序）。
+     * 返回下一个空闲槽位。
+     */
+    static native int nativeRegisterOwnedDex(Object cookie, int startIndex, String source);
+    /** 写出 dex_manifest.json（槽位 / location / checksum，组包以它为准） */
+    static native void nativeFlushOwnedDexManifest();
     //add end
 }

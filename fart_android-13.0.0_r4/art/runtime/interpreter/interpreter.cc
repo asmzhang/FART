@@ -38,7 +38,9 @@
 namespace art {
 
     //add
-    extern "C" void traceDexExecution(ArtMethod* artmethod);
+    // <clinit> 必须走 CodeItem 捕获（traceMethodCode），不能只用整包 DEX 一次性 dump：
+    // 加固壳常在 Execute 入口才解开 body，整包快照会漏掉后续 clinit。
+    extern "C" void traceMethodCode(ArtMethod* artmethod);
     //add end
 
 namespace interpreter {
@@ -268,8 +270,13 @@ static inline JValue Execute(
     bool stay_in_interpreter = false,
     bool from_deoptimize = false) REQUIRES_SHARED(Locks::mutator_lock_) {
   //add
-  if(strstr(shadow_frame.GetMethod()->PrettyMethod().c_str(),"<clinit>") != nullptr) {
-    traceDexExecution(shadow_frame.GetMethod());
+  // <clinit> decrypt window — capture ArtMethod CodeItem into *_ins_*.bin
+  // 用 IsClassInitializer()，禁止 PrettyMethod()+strstr：每个进 Execute 的方法都会跑到这里。
+  {
+    ArtMethod* execute_method = shadow_frame.GetMethod();
+    if (UNLIKELY(execute_method != nullptr && execute_method->IsClassInitializer())) {
+      traceMethodCode(execute_method);
+    }
   }
   //add end
 

@@ -2,11 +2,31 @@
 
 # FART 源码
 
-
-
 FART 是 ART 环境下基于主动调用的自动化脱壳方案。
 
+**本地用法与 android-13 `<clinit>` 补丁说明：见同目录 [`使用说明.txt`](./使用说明.txt)。**
 
+本仓库按版本存放「已改文件」overlay（非整棵 AOSP）：
+
+| 目录 | 说明 |
+|------|------|
+| `fart6` / `fart8` / `fart10` | 历史移植对照 |
+| `fart_android-13.0.0_r4` | Android 13 当前补丁树 |
+
+缺基线时从对应 AOSP tag **拉单文件**再叠补丁，不必把整树 sync 进本目录。
+
+## android-13：`<clinit>` → `traceMethodCode`（相对上游文档的变更）
+
+上游 / 旧移植在 `Execute` 里对 `<clinit>` 调用整包 `dumpDexFileByExecute` / `traceDexExecution`（按 DEX begin 只 dump 一次，**不写**方法 `*_ins_*.bin`）。反射主动调用也拿不到 `<clinit>`，类初始化体常成残留。
+
+当前 `fart_android-13.0.0_r4` 约定：
+
+1. `interpreter.cc`：`IsClassInitializer()` 时调用 **`traceMethodCode`**（禁止热路径 `PrettyMethod()+strstr`）。
+2. `art_method.cc`：Execute 热路径**只写 CodeItem**（越界丢弃）；整包 DEX 在 JNI 登记/flush 写出。`(dex_begin, method_idx)` 去重；占位 `<clinit>` 不进集。
+3. 主动调用仍走 `Invoke` → `traceMethodCode`，与上共用 `ins.bin`；`is_fix` 缓冲区在 `nativeSetFixEnabled` 预填。
+
+刷机前建议先用 Frida 确认解密窗口是否在 Execute 入口；验收命令见 `使用说明.txt`。  
+下文为上游移植长文（符号名多为旧版 `dumpArtMethod` / `dumpDexFileByExecute`），与 r13 overlay **以实际源文件为准**。
 
 关于 FART 详细介绍参考：
 
@@ -14,13 +34,9 @@ FART 是 ART 环境下基于主动调用的自动化脱壳方案。
 
 - [FART 主动调用组件设计和源码分析](https://cyrus-studio.github.io/blog/posts/fart-%E4%B8%BB%E5%8A%A8%E8%B0%83%E7%94%A8%E7%BB%84%E4%BB%B6%E8%AE%BE%E8%AE%A1%E5%92%8C%E6%BA%90%E7%A0%81%E5%88%86%E6%9E%90/)
 
-
-
 开源地址：[https://github.com/hanbinglengyue/FART](https://github.com/hanbinglengyue/FART)
 
-
-
-目前 FART 是基于 Android 6.0 实现，源码文件结构如下：
+目前上游介绍基于 Android 6.0；本仓库另有 `fart8` / `fart10` / `fart_android-13.0.0_r4` overlay，以对应目录源文件为准。下文为 6.0 移植长文：
 
 
 
@@ -67,6 +83,8 @@ extern "C" void dumpDexFileByExecute(ArtMethod* artmethod);
 
 
 在 Execute 函数头部增加 dumpDexFileByExecute 调用
+
+> **android-13 overlay 已变更**：`<clinit>` 改为 `IsClassInitializer()` → `traceMethodCode`（写 `*_ins_*.bin`），不再只用整包 `traceDexExecution`。见 [`使用说明.txt`](./使用说明.txt)。下文仍为上游旧示例。
 
 ```
 static inline JValue Execute(

@@ -61,10 +61,18 @@
 namespace art {
 
     //add
+    static bool ConvertJavaArrayToDexFiles(
+        JNIEnv* env,
+        jobject arrayObject,
+        std::vector<const DexFile*>& dex_files,
+        const OatFile*& oat_file);
+
     extern "C" void callNativeMethodInspector(ArtMethod* artmethod);
     extern "C" ArtMethod* convertToArtMethodPtr(JNIEnv* env, jobject javaMethod);
     extern "C" void setFartFixEnabled(bool enabled);
     extern "C" void flushFixedDex();
+    extern "C" int fartRegisterOwnedDex(const void* dex_file, int force_index, const char* source);
+    extern "C" void fartFlushOwnedDexManifest();
 
     static void DexFile_nativeDumpCode(JNIEnv* env, jclass, jobject method) {
         if (method != nullptr) {
@@ -79,6 +87,48 @@ namespace art {
 
     static void DexFile_nativeFlushFixedDex(JNIEnv*, jclass) {
         flushFixedDex();
+    }
+
+    static jint DexFile_nativeRegisterOwnedDex(JNIEnv* env, jclass, jobject cookie,
+                                               jint start_index, jstring jsource) {
+        if (cookie == nullptr) {
+            return start_index;
+        }
+        jclass long_array_class = env->FindClass("[J");
+        if (long_array_class == nullptr || !env->IsInstanceOf(cookie, long_array_class)) {
+            env->ExceptionClear();
+            return start_index;
+        }
+        jsize cookie_len = env->GetArrayLength(reinterpret_cast<jarray>(cookie));
+        if (env->ExceptionCheck() == JNI_TRUE || cookie_len < 2) {
+            env->ExceptionClear();
+            return start_index;
+        }
+        std::vector<const DexFile*> dex_files;
+        const OatFile* oat_file = nullptr;
+        if (!ConvertJavaArrayToDexFiles(env, cookie, dex_files, oat_file)) {
+            env->ExceptionClear();
+            return start_index;
+        }
+        std::string source = "cookie";
+        if (jsource != nullptr) {
+            ScopedUtfChars chars(env, jsource);
+            if (chars.c_str() != nullptr) {
+                source = chars.c_str();
+            }
+        }
+        int next = start_index;
+        for (const DexFile* dex : dex_files) {
+            if (dex == nullptr) {
+                continue;
+            }
+            next = fartRegisterOwnedDex(dex, next, source.c_str());
+        }
+        return next;
+    }
+
+    static void DexFile_nativeFlushOwnedDexManifest(JNIEnv*, jclass) {
+        fartFlushOwnedDexManifest();
     }
     //add end
 using android::base::StringPrintf;
@@ -999,6 +1049,8 @@ static JNINativeMethod gMethods[] = {
   NATIVE_METHOD(DexFile, nativeDumpCode, "(Ljava/lang/Object;)V"),
   NATIVE_METHOD(DexFile, nativeSetFixEnabled, "(Z)V"),
   NATIVE_METHOD(DexFile, nativeFlushFixedDex, "()V"),
+  NATIVE_METHOD(DexFile, nativeRegisterOwnedDex, "(Ljava/lang/Object;ILjava/lang/String;)I"),
+  NATIVE_METHOD(DexFile, nativeFlushOwnedDexManifest, "()V"),
   //add end
 };
 

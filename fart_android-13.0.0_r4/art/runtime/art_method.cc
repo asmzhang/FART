@@ -55,10 +55,13 @@
 #include "vdex_file.h"
 
 //add
+#include <algorithm>
 #include <atomic>
 #include <map>
 #include <mutex>
 #include <set>
+#include <sstream>
+#include <utility>
 #include <vector>
 #include <sys/syscall.h>
 #include <sys/types.h>
@@ -160,19 +163,377 @@ namespace art {
                strstr(procName, "soong") == nullptr;
     }
 
+    static std::string packageFromProcName(const char* procName) {
+        std::string pkg = procName != nullptr ? procName : "";
+        size_t colon = pkg.find(':');
+        if (colon != std::string::npos) {
+            pkg.resize(colon);
+        }
+        return pkg;
+    }
+
+    static bool isInMemoryDexLocation(const std::string& loc) {
+        if (loc.empty()) {
+            return true;
+        }
+        if (loc.find("Anonymous") != std::string::npos ||
+            loc.find("anonymous") != std::string::npos ||
+            loc.find("memfd") != std::string::npos ||
+            loc.find("InMemory") != std::string::npos ||
+            loc.find("in-memory") != std::string::npos) {
+            return true;
+        }
+        return false;
+    }
+
+    static bool isSystemDexLocation(const std::string& loc) {
+        if (isInMemoryDexLocation(loc)) {
+            return false;
+        }
+        auto starts = [&](const char* prefix) {
+            return loc.rfind(prefix, 0) == 0;
+        };
+        if (starts("/system/") || starts("/system_ext/") || starts("/apex/") ||
+            starts("/vendor/") || starts("/product/") || starts("/framework/") ||
+            starts("/data/dalvik-cache/") || starts("/data/misc/")) {
+            return true;
+        }
+        if (loc.find("/apex/") != std::string::npos) {
+            return true;
+        }
+        if (loc.find("/system/framework/") != std::string::npos) {
+            return true;
+        }
+        if (loc.find("boot.oat") != std::string::npos ||
+            loc.find("boot.vdex") != std::string::npos ||
+            loc.find("boot-framework") != std::string::npos) {
+            return true;
+        }
+        return false;
+    }
+
+    static bool pathContainsPackage(const std::string& loc, const std::string& pkg) {
+        if (pkg.empty() || loc.empty()) {
+            return false;
+        }
+        if (loc.find("/" + pkg + "-") != std::string::npos) {
+            return true;
+        }
+        if (loc.find("/" + pkg + "/") != std::string::npos) {
+            return true;
+        }
+        if (loc.find("/" + pkg + "!") != std::string::npos) {
+            return true;
+        }
+        if (loc.size() >= pkg.size() &&
+            loc.compare(loc.size() - pkg.size(), pkg.size(), pkg) == 0) {
+            if (loc.size() == pkg.size() || loc[loc.size() - pkg.size() - 1] == '/') {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static bool locationBelongsToApp(const std::string& loc, const std::string& pkg) {
+        (void)pkg;
+        // 本进程内：只丢掉系统 DEX。壳/原包/加密体/内存/自定义/动态全部保留，分类给人看。
+        if (isSystemDexLocation(loc)) {
+            return false;
+        }
+        return true;
+    }
+
+    static bool isCompactDexMagic(const DexFile* dex) {
+        if (dex == nullptr || dex->Begin() == nullptr || dex->Size() < 4) {
+            return false;
+        }
+        return memcmp(dex->Begin(), "cdex", 4) == 0;
+    }
+
+    static void jsonEscapeAppend(std::string* out, const std::string& s) {
+        for (unsigned char c : s) {
+            switch (c) {
+                case '"': *out += "\\\""; break;
+                case '\\': *out += "\\\\"; break;
+                case '\n': *out += "\\n"; break;
+                case '\r': *out += "\\r"; break;
+                case '\t': *out += "\\t"; break;
+                default:
+                    if (c < 0x20) {
+                        char buf[8];
+                        snprintf(buf, sizeof(buf), "\\u%04x", c);
+                        *out += buf;
+                    } else {
+                        *out += static_cast<char>(c);
+                    }
+            }
+        }
+    }
+
+    struct OwnedDexInfo {
+        int index = -1;
+        size_t size = 0;
+        uint32_t checksum = 0;
+        std::string location;
+        std::string source;
+        std::string begin_hex;
+        std::string kind;
+        bool compact = false;
+        bool java_assigned = false;
+    };
+
+    static std::mutex g_fart_mutex;
+    static std::map<const uint8_t*, OwnedDexInfo> g_owned_dex_map;
+    static std::atomic<bool> g_owned_java_ready{false};
+    static std::map<const uint8_t*, int> g_dex_counter_map;
+    static std::set<const uint8_t*> g_dumped_dex_set;
+
+    static std::string inferKind(const std::string& source, const std::string& loc) {
+        if (isInMemoryDexLocation(loc)) {
+            return "inmemory";
+        }
+        if (source.find("custom") != std::string::npos) {
+            return "custom";
+        }
+        if (source.find("primary") != std::string::npos) {
+            return "primary";
+        }
+        if (source.find("extra") != std::string::npos) {
+            return "extra";
+        }
+        if (loc.find("split_") != std::string::npos) {
+            return "extra";
+        }
+        if (loc.find(".apk") != std::string::npos || loc.find("!classes") != std::string::npos) {
+            return "primary";
+        }
+        if (source.find("auto") != std::string::npos || source == "pre-register") {
+            return "auto";
+        }
+        return "extra";
+    }
+
+    static std::string sanitizeKind(const std::string& kind) {
+        if (kind == "primary" || kind == "extra" || kind == "custom" ||
+            kind == "inmemory" || kind == "auto") {
+            return kind;
+        }
+        return "extra";
+    }
+
+    static bool writeAllBytes(const std::string& path, const void* data, size_t n) {
+        int fp = open(path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0666);
+        if (fp < 0) {
+            return false;
+        }
+        ssize_t w = write(fp, data, n);
+        fsync(fp);
+        close(fp);
+        return w >= 0;
+    }
+
+    static bool looksLikeDexMagic(const uint8_t* begin, size_t size) {
+        if (begin == nullptr || size < 8) {
+            return false;
+        }
+        return memcmp(begin, "dex\n", 4) == 0 || memcmp(begin, "cdex", 4) == 0;
+    }
+
+    static bool fileNonEmpty(const std::string& path) {
+        struct stat st;
+        return stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0;
+    }
+
+    static std::mutex g_cyrus_dir_mu;
+    static std::string g_cached_cyrus_dir;
+    static pid_t g_cached_cyrus_pid = -1;
+    static std::string g_cached_cyrus_pkg;
+
+    static bool getCyrusDir(std::string* out_dir, std::string* out_pkg = nullptr) {
+        pid_t pid = getpid();
+        {
+            std::lock_guard<std::mutex> lock(g_cyrus_dir_mu);
+            if (pid == g_cached_cyrus_pid && !g_cached_cyrus_dir.empty()) {
+                if (out_dir != nullptr) {
+                    *out_dir = g_cached_cyrus_dir;
+                }
+                if (out_pkg != nullptr) {
+                    *out_pkg = g_cached_cyrus_pkg;
+                }
+                return true;
+            }
+        }
+        char szProcName[256] = {0};
+        char szCmdline[64] = {0};
+        snprintf(szCmdline, sizeof(szCmdline), "/proc/%d/cmdline", pid);
+        int fcmdline = open(szCmdline, O_RDONLY);
+        if (fcmdline >= 0) {
+            ssize_t n = read(fcmdline, szProcName, sizeof(szProcName) - 1);
+            (void)n;
+            close(fcmdline);
+        }
+        if (szProcName[0] == '\0' || !isValidAndroidApp(szProcName)) {
+            return false;
+        }
+        std::string pkg = packageFromProcName(szProcName);
+        std::string app_dir = std::string("/data/data/") + pkg;
+        std::string cyrus_dir = app_dir + "/cyrus_" + pkg;
+        ensure_dir_exists(app_dir);
+        ensure_dir_exists(cyrus_dir);
+        {
+            std::lock_guard<std::mutex> lock(g_cyrus_dir_mu);
+            g_cached_cyrus_dir = cyrus_dir;
+            g_cached_cyrus_pkg = pkg;
+            g_cached_cyrus_pid = pid;
+        }
+        if (out_dir != nullptr) {
+            *out_dir = cyrus_dir;
+        }
+        if (out_pkg != nullptr) {
+            *out_pkg = pkg;
+        }
+        return true;
+    }
+
+    // JNI / flush 路径写 DEX（禁止在 Execute/mutator 热路径调用）。
+    static void dumpDexToCyrus(const uint8_t* begin, size_t size, int index,
+                               const std::string& kind, const DexFile* dex_for_list) {
+        if (!looksLikeDexMagic(begin, size) || index < 0) {
+            return;
+        }
+        std::string cyrus_dir;
+        if (!getCyrusDir(&cyrus_dir)) {
+            return;
+        }
+        std::string k = sanitizeKind(kind);
+        std::string kind_dir = cyrus_dir + "/" + k;
+        ensure_dir_exists(kind_dir);
+        int size_int = static_cast<int>(size);
+        char kind_name[128];
+        snprintf(kind_name, sizeof(kind_name), "%03d_%d_dex_file.dex", index, size_int);
+        std::string legacy = cyrus_dir + "/" + std::to_string(size_int) + "_" +
+                             std::to_string(index) + "_dex_file.dex";
+        std::string kind_path = kind_dir + "/" + kind_name;
+        if (fileNonEmpty(legacy) && fileNonEmpty(kind_path)) {
+            std::lock_guard<std::mutex> lock(g_fart_mutex);
+            g_dumped_dex_set.insert(begin);
+            g_dex_counter_map[begin] = index;
+            return;
+        }
+        writeAllBytes(legacy, begin, size);
+        writeAllBytes(kind_path, begin, size);
+        if (dex_for_list != nullptr) {
+            std::string class_list;
+            for (size_t i = 0; i < dex_for_list->NumClassDefs(); ++i) {
+                const dex::ClassDef& class_def = dex_for_list->GetClassDef(i);
+                const char* descriptor = dex_for_list->GetClassDescriptor(class_def);
+                if (descriptor != nullptr) {
+                    class_list.append(descriptor);
+                    class_list.push_back('\n');
+                }
+            }
+            writeAllBytes(cyrus_dir + "/" + std::to_string(size_int) + "_" +
+                              std::to_string(index) + "_class_list.txt",
+                          class_list.data(), class_list.size());
+            writeAllBytes(kind_dir + "/" + std::to_string(index) + "_" +
+                              std::to_string(size_int) + "_class_list.txt",
+                          class_list.data(), class_list.size());
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_fart_mutex);
+            g_dumped_dex_set.insert(begin);
+            g_dex_counter_map[begin] = index;
+        }
+    }
+
+    static std::string pointerToHex(const void* p) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "0x%llx", static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(p)));
+        return std::string(buf);
+    }
+
+    static int maxOwnedIndexLocked() {
+        int m = -1;
+        for (const auto& kv : g_owned_dex_map) {
+            if (kv.second.index > m) {
+                m = kv.second.index;
+            }
+        }
+        return m;
+    }
+
+    static void relocateConflictingIndexLocked(const uint8_t* keep_begin, int index) {
+        int spill = maxOwnedIndexLocked() + 1;
+        if (spill <= index) {
+            spill = index + 1;
+        }
+        for (auto& kv : g_owned_dex_map) {
+            if (kv.first == keep_begin) {
+                continue;
+            }
+            if (kv.second.index != index) {
+                continue;
+            }
+            if (kv.second.java_assigned) {
+                continue;
+            }
+            kv.second.index = spill++;
+            kv.second.source = kv.second.source.empty()
+                ? "relocated" : (kv.second.source + "|relocated");
+            g_dex_counter_map[kv.first] = kv.second.index;
+        }
+    }
+
+    static bool prepareOwnedDex(const DexFile* dex_file, const std::string& pkg, int* out_slot)
+        REQUIRES_SHARED(Locks::mutator_lock_) {
+        if (dex_file == nullptr || out_slot == nullptr) {
+            return false;
+        }
+        const uint8_t* begin = dex_file->Begin();
+        const std::string& loc = dex_file->GetLocation();
+        if (isSystemDexLocation(loc)) {
+            return false;
+        }
+
+        std::lock_guard<std::mutex> lock(g_fart_mutex);
+        auto it = g_owned_dex_map.find(begin);
+        if (it != g_owned_dex_map.end()) {
+            *out_slot = it->second.index;
+            g_dex_counter_map[begin] = it->second.index;
+            return true;
+        }
+
+        if (!locationBelongsToApp(loc, pkg)) {
+            return false;
+        }
+
+        int idx = maxOwnedIndexLocked() + 1;
+        OwnedDexInfo info;
+        info.index = idx;
+        info.size = dex_file->Size();
+        info.checksum = dex_file->GetLocationChecksum();
+        info.location = loc;
+        info.source = g_owned_java_ready.load() ? "auto-discovered" : "pre-register";
+        info.kind = inferKind(info.source, loc);
+        info.begin_hex = pointerToHex(begin);
+        info.compact = isCompactDexMagic(dex_file);
+        info.java_assigned = false;
+        g_owned_dex_map[begin] = info;
+        g_dex_counter_map[begin] = idx;
+        *out_slot = idx;
+        return true;
+    }
+
     // FART: 线程局部标志位，替代 self==nullptr 作为主动触发信号，避免误触发
     thread_local bool g_fart_trace_active = false;
     // FART: 原子计数器，配合 DEX 大小生成唯一文件名，解决同尺寸 DEX 覆盖问题
     static std::atomic<int> g_fart_dump_counter{0};
-    // FART: 互斥锁 + 去重集合，基于 DEX 内存起始地址防止重复 dump
-    static std::mutex g_fart_mutex;
-    static std::set<const uint8_t*> g_dumped_dex_set;
+    // FART: CodeItem 方法级去重（dex_begin + method_idx），避免 Execute/<clinit> 重复写 ins.bin
+    static std::set<std::pair<const uint8_t*, uint32_t>> g_dumped_method_set;
     // FART fix: 是否启用内存修复DEX功能（将CodeItem回写生成修复后的DEX）
     static std::atomic<bool> g_fart_fix_enabled{false};
     // FART fix: DEX起始地址 → 可写缓冲区（受 g_fart_mutex 保护）
     static std::map<const uint8_t*, std::vector<uint8_t>> g_dex_fix_buffers;
-    // FART fix: DEX起始地址 → 文件计数器（受 g_fart_mutex 保护）
-    static std::map<const uint8_t*, int> g_dex_counter_map;
 
     extern "C" void traceDexExecution(ArtMethod* artmethod) REQUIRES_SHARED(Locks::mutator_lock_) {
             char szCmdline[64] = {0};
@@ -202,28 +563,31 @@ namespace art {
             }
 
             const DexFile* dex_file = artmethod->GetDexFile();
+            int slot = 0;
+            if (!prepareOwnedDex(dex_file, packageFromProcName(szProcName), &slot)) {
+                return;
+            }
             const uint8_t* begin_ = dex_file->Begin();
             size_t size_ = dex_file->Size();
             int size_int = static_cast<int>(size_);
 
-            // 创建目录：/data/data/<packageName>/cyrus_packageName
+            std::string pkg = packageFromProcName(szProcName);
             std::string base_dir = "/data/data/";
-            std::string app_dir = base_dir + szProcName;
-            std::string cyrus_dir = app_dir + "/cyrus_" + szProcName;
+            std::string app_dir = base_dir + pkg;
+            std::string cyrus_dir = app_dir + "/cyrus_" + pkg;
 
             ensure_dir_exists(app_dir);
             ensure_dir_exists(cyrus_dir);
 
             // 去重：跳过已 dump 过的 DEX（基于内存起始地址）；同时分配计数器并初始化 fix 缓冲区
-            int counter = 0;
+            int counter = slot;
             {
                 std::lock_guard<std::mutex> lock(g_fart_mutex);
                 if (g_dumped_dex_set.count(begin_) > 0) {
                     return;
                 }
                 g_dumped_dex_set.insert(begin_);
-                counter = g_fart_dump_counter.fetch_add(1);
-                g_dex_counter_map[begin_] = counter;
+                g_dex_counter_map[begin_] = slot;
                 if (g_fart_fix_enabled.load()) {
                     auto& buf = g_dex_fix_buffers[begin_];
                     if (buf.empty()) {
@@ -278,116 +642,38 @@ namespace art {
     }
 
     extern "C" void traceMethodCode(ArtMethod* artmethod) REQUIRES_SHARED(Locks::mutator_lock_) {
-            char szProcName[256] = {0};
-            int procid = getpid();
-
-            // 获取进程名
-            char szCmdline[64] = {0};
-            snprintf(szCmdline, sizeof(szCmdline), "/proc/%d/cmdline", procid);
-            int fcmdline = open(szCmdline, O_RDONLY);
-            if (fcmdline >= 0) {
-                ssize_t result = read(fcmdline, szProcName, sizeof(szProcName) - 1);
-                if (result < 0) {
-                    LOG(ERROR) << "ArtMethod::traceMethodCode: read cmdline failed.";
-                }
-                close(fcmdline);
-            } else {
-                LOG(ERROR) << "[traceMethodCode] " << szCmdline << " open failed ";
-            }
-
-            if (szProcName[0] == '\0') {
-                LOG(WARNING) << "[traceMethodCode] 获取进程名失败：" << artmethod->PrettyMethod();
+            if (artmethod == nullptr) {
                 return;
             }
-
-            if (!isValidAndroidApp(szProcName)) {
-                LOG(WARNING) << "[traceMethodCode] 当前进程 " << szProcName << " 非法，跳过 dex dump";
-                return;
-            }
-
             const DexFile* dex_file = artmethod->GetDexFile();
+            if (dex_file == nullptr || dex_file->Begin() == nullptr) {
+                return;
+            }
+            std::string cyrus_dir;
+            std::string pkg;
+            if (!getCyrusDir(&cyrus_dir, &pkg)) {
+                return;
+            }
+            int slot = 0;
+            if (!prepareOwnedDex(dex_file, pkg, &slot)) {
+                return;
+            }
             const uint8_t* begin_ = dex_file->Begin();
             size_t size_ = dex_file->Size();
             int size_int = static_cast<int>(size_);
-
-            // 创建目录：/data/data/<packageName>/cyrus_packageName
-            std::string base_dir = "/data/data/";
-            std::string app_dir = base_dir + szProcName;
-            std::string cyrus_dir = app_dir + "/cyrus_" + szProcName;
-            std::string fix_dir = cyrus_dir + "/fix";
-
-            ensure_dir_exists(app_dir);
-            ensure_dir_exists(cyrus_dir);
-            ensure_dir_exists(fix_dir);
-
-            // 去重：跳过已 dump 过的 DEX（与 traceDexExecution 共用同一去重集合）
-            bool need_dump_dex = false;
-            int counter = 0;
+            std::string kind = "auto";
             {
                 std::lock_guard<std::mutex> lock(g_fart_mutex);
-                if (g_dumped_dex_set.count(begin_) == 0) {
-                    g_dumped_dex_set.insert(begin_);
-                    counter = g_fart_dump_counter.fetch_add(1);
-                    need_dump_dex = true;
-                    g_dex_counter_map[begin_] = counter;
-                } else {
-                    counter = g_dex_counter_map[begin_];
-                }
-                if (g_fart_fix_enabled.load()) {
-                    auto& buf = g_dex_fix_buffers[begin_];
-                    if (buf.empty()) {
-                        buf.assign(begin_, begin_ + size_);
-                    }
+                auto kit = g_owned_dex_map.find(begin_);
+                if (kit != g_owned_dex_map.end()) {
+                    kind = sanitizeKind(kit->second.kind.empty()
+                        ? inferKind(kit->second.source, kit->second.location)
+                        : kit->second.kind);
                 }
             }
+            std::string kind_dir = cyrus_dir + "/" + kind;
 
-            // 计数器命名，避免同尺寸 DEX 覆盖（仅在首次 dump 时写入）
-            if (need_dump_dex) {
-                std::string dex_path = cyrus_dir + "/" + std::to_string(size_int) + "_" +
-                                       std::to_string(counter) + "_dex_file.dex";
-                std::string class_list_path = cyrus_dir + "/" + std::to_string(size_int) + "_" +
-                                              std::to_string(counter) + "_class_list.txt";
-
-                LOG(INFO) << "[traceMethodCode]" << artmethod->PrettyMethod() << " dump to " << dex_path;
-
-                int fp = open(dex_path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0666);
-                if (fp >= 0) {
-                    ssize_t w = write(fp, begin_, size_);
-                    if (w < 0) {
-                        LOG(ERROR) << "ArtMethod::traceMethodCode: write dexfile failed, errno=" << errno;
-                    }
-                    fsync(fp);
-                    close(fp);
-
-                    int class_list_file = open(class_list_path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0666);
-                    if (class_list_file >= 0) {
-                        for (size_t i = 0; i < dex_file->NumClassDefs(); ++i) {
-                            const dex::ClassDef& class_def = dex_file->GetClassDef(i);
-                            const char* descriptor = dex_file->GetClassDescriptor(class_def);
-
-                            ssize_t w1 = write(class_list_file, descriptor, strlen(descriptor));
-                            if (w1 < 0) {
-                                LOG(ERROR) << "ArtMethod::traceMethodCode: write class descriptor failed";
-                            }
-
-                            ssize_t w2 = write(class_list_file, "\n", 1);
-                            if (w2 < 0) {
-                                LOG(ERROR) << "ArtMethod::traceMethodCode: write newline failed";
-                            }
-                        }
-                        fsync(class_list_file);
-                        close(class_list_file);
-                    } else {
-                        LOG(ERROR) << "[traceMethodCode] open class list failed: " << class_list_path
-                                   << ", errno=" << errno;
-                    }
-                } else {
-                    LOG(ERROR) << "[traceMethodCode] open dex failed: " << dex_path
-                               << ", errno=" << errno;
-                }
-            }
-
-            // 保存指令码
+            // Execute 热路径只写 CodeItem；整包 DEX 由 JNI 登记 / flush 写出，避免 mutator 下大 I/O。
             const dex::CodeItem* code_item = artmethod->GetCodeItem();
             if (LIKELY(code_item != nullptr)) {
                 uint8_t* item = (uint8_t*)code_item;
@@ -403,22 +689,59 @@ namespace art {
 
                 uint32_t method_idx = artmethod->GetDexMethodIndex();
                 int offset = static_cast<int>(item - begin_);
+                if (code_item_len <= 0 || offset < 0 ||
+                    static_cast<size_t>(offset) >= size_ ||
+                    static_cast<size_t>(offset) + static_cast<size_t>(code_item_len) > size_) {
+                    return;
+                }
+
+                // 仅 <clinit>：掏空/占位体（常见 return-void）不写、不进集，避免锁死假窗口。
+                if (artmethod->IsClassInitializer()) {
+                    const uint32_t insns_units = accessor.InsnsSizeInCodeUnits();
+                    const bool looks_placeholder =
+                        (insns_units <= 1u) ||
+                        (code_item_len > 0 && code_item_len <= 18);
+                    if (looks_placeholder) {
+                        return;
+                    }
+                }
+
+                // 进集后再写盘，避免并发双写；占位 clinit 已在上面返回，解密后仍可再进。
+                {
+                    std::lock_guard<std::mutex> lock(g_fart_mutex);
+                    if (g_dumped_method_set.count(std::make_pair(begin_, method_idx)) > 0) {
+                        return;
+                    }
+                    g_dumped_method_set.insert(std::make_pair(begin_, method_idx));
+                }
+
                 pid_t tid = gettidv1();
-                // 保存 CodeItem
+                ensure_dir_exists(cyrus_dir);
+                ensure_dir_exists(kind_dir);
                 std::string ins_path = cyrus_dir + "/" + std::to_string(size_int) + "_ins_" + std::to_string(tid) + ".bin";
+                std::string kind_ins_path = kind_dir + "/" + std::to_string(size_int) + "_ins_" + std::to_string(tid) + ".bin";
 
                 int fp2 = open(ins_path.c_str(), O_CREAT | O_APPEND | O_RDWR, 0666);
+                int fp3 = open(kind_ins_path.c_str(), O_CREAT | O_APPEND | O_RDWR, 0666);
                 if (fp2 >= 0) {
                     lseek(fp2, 0, SEEK_END);
+                    if (fp3 >= 0) {
+                        lseek(fp3, 0, SEEK_END);
+                    }
                     std::string header = "{name:" + artmethod->PrettyMethod() +
                                          ",method_idx:" + std::to_string(method_idx) +
                                          ",offset:" + std::to_string(offset) +
                                          ",code_item_len:" + std::to_string(code_item_len) +
+                                         ",dex_index:" + std::to_string(slot) +
+                                         ",kind:" + kind +
                                          ",ins:";
 
                     ssize_t w3 = write(fp2, header.c_str(), header.length());
                     if (w3 < 0) {
                         LOG(ERROR) << "ArtMethod::traceMethodCode: write header failed";
+                    }
+                    if (fp3 >= 0) {
+                        write(fp3, header.c_str(), header.length());
                     }
 
                     long outlen = 0;
@@ -428,6 +751,9 @@ namespace art {
                         if (w4 < 0) {
                             LOG(ERROR) << "ArtMethod::traceMethodCode: write base64 ins failed";
                         }
+                        if (fp3 >= 0) {
+                            write(fp3, base64result, outlen);
+                        }
                         free(base64result);
                     }
 
@@ -435,8 +761,12 @@ namespace art {
                     if (w5 < 0) {
                         LOG(ERROR) << "ArtMethod::traceMethodCode: write tail failed";
                     }
+                    if (fp3 >= 0) {
+                        write(fp3, "};", 2);
+                        close(fp3);
+                    }
 
-                    fsync(fp2);
+                    // clinit 热路径：不做 fsync，降低 mutator 下卡顿/ANR 风险
                     close(fp2);
 
                     // Fix DEX: 将真实 CodeItem 指令回写到内存缓冲区
@@ -450,6 +780,8 @@ namespace art {
                       }
                     }
                 } else {
+                    std::lock_guard<std::mutex> lock(g_fart_mutex);
+                    g_dumped_method_set.erase(std::make_pair(begin_, method_idx));
                     LOG(ERROR) << "[traceMethodCode] " << ins_path << " open failed, fp2=" << fp2;
                 }
             }
@@ -457,7 +789,189 @@ namespace art {
 
     extern "C" void setFartFixEnabled(bool enabled) {
         g_fart_fix_enabled.store(enabled);
+        if (enabled) {
+            std::lock_guard<std::mutex> lock(g_fart_mutex);
+            for (const auto& kv : g_owned_dex_map) {
+                const uint8_t* begin = kv.first;
+                size_t n = kv.second.size;
+                if (begin == nullptr || n == 0 || !looksLikeDexMagic(begin, n)) {
+                    continue;
+                }
+                auto& buf = g_dex_fix_buffers[begin];
+                if (buf.empty()) {
+                    buf.assign(begin, begin + n);
+                }
+            }
+        }
         LOG(INFO) << "[setFartFixEnabled] fix mode " << (enabled ? "enabled" : "disabled");
+    }
+
+    extern "C" int fartRegisterOwnedDex(const void* dex_file_ptr, int force_index, const char* source) {
+        const DexFile* dex = reinterpret_cast<const DexFile*>(dex_file_ptr);
+        if (dex == nullptr || force_index < 0) {
+            return force_index;
+        }
+        const uint8_t* begin = dex->Begin();
+        size_t size = dex->Size();
+        if (!looksLikeDexMagic(begin, size)) {
+            return force_index;
+        }
+        const std::string& loc = dex->GetLocation();
+        if (isSystemDexLocation(loc)) {
+            return force_index;
+        }
+        std::string out_kind;
+        int out_index = force_index;
+        int ret_next = force_index + 1;
+        {
+            std::lock_guard<std::mutex> lock(g_fart_mutex);
+            auto it = g_owned_dex_map.find(begin);
+            if (it != g_owned_dex_map.end() && it->second.java_assigned) {
+                int next = it->second.index + 1;
+                if (next < force_index) {
+                    next = force_index;
+                }
+                out_kind = it->second.kind;
+                out_index = it->second.index;
+                ret_next = next;
+            } else {
+                relocateConflictingIndexLocked(begin, force_index);
+                it = g_owned_dex_map.find(begin);
+                if (it != g_owned_dex_map.end()) {
+                    it->second.index = force_index;
+                    it->second.java_assigned = true;
+                    if (source != nullptr && source[0] != '\0') {
+                        it->second.source = source;
+                    }
+                    it->second.size = dex->Size();
+                    it->second.checksum = dex->GetLocationChecksum();
+                    it->second.location = loc;
+                    it->second.begin_hex = pointerToHex(begin);
+                    it->second.compact = isCompactDexMagic(dex);
+                    it->second.kind = inferKind(it->second.source, loc);
+                    g_dex_counter_map[begin] = force_index;
+                    out_kind = it->second.kind;
+                } else {
+                    OwnedDexInfo info;
+                    info.index = force_index;
+                    info.size = dex->Size();
+                    info.checksum = dex->GetLocationChecksum();
+                    info.location = loc;
+                    info.source = source != nullptr ? source : "java";
+                    info.begin_hex = pointerToHex(begin);
+                    info.compact = isCompactDexMagic(dex);
+                    info.java_assigned = true;
+                    info.kind = inferKind(info.source, loc);
+                    g_owned_dex_map[begin] = info;
+                    g_dex_counter_map[begin] = force_index;
+                    out_kind = info.kind;
+                }
+                g_owned_java_ready.store(true);
+                out_index = force_index;
+                ret_next = force_index + 1;
+                LOG(INFO) << "[registerOwnedDex] index=" << force_index
+                          << " size=" << dex->Size()
+                          << " loc=" << loc
+                          << " source=" << (source != nullptr ? source : "");
+            }
+        }
+        dumpDexToCyrus(begin, size, out_index, out_kind, dex);
+        return ret_next;
+    }
+
+    extern "C" void fartFlushOwnedDexManifest() {
+        char szProcName[256] = {0};
+        int procid = getpid();
+        char szCmdline[64] = {0};
+        snprintf(szCmdline, sizeof(szCmdline), "/proc/%d/cmdline", procid);
+        int fcmdline = open(szCmdline, O_RDONLY);
+        if (fcmdline >= 0) {
+            ssize_t result = read(fcmdline, szProcName, sizeof(szProcName) - 1);
+            if (result < 0) {
+                LOG(ERROR) << "[owned-manifest] read cmdline failed";
+            }
+            close(fcmdline);
+        }
+        if (szProcName[0] == '\0' || !isValidAndroidApp(szProcName)) {
+            LOG(WARNING) << "[owned-manifest] skip, proc=" << szProcName;
+            return;
+        }
+
+        std::string pkg = packageFromProcName(szProcName);
+        std::string cyrus_dir = std::string("/data/data/") + pkg + "/cyrus_" + pkg;
+        ensure_dir_exists(std::string("/data/data/") + pkg);
+        ensure_dir_exists(cyrus_dir);
+
+        std::vector<OwnedDexInfo> slots;
+        {
+            std::lock_guard<std::mutex> lock(g_fart_mutex);
+            slots.reserve(g_owned_dex_map.size());
+            for (const auto& kv : g_owned_dex_map) {
+                slots.push_back(kv.second);
+            }
+        }
+        std::sort(slots.begin(), slots.end(),
+                  [](const OwnedDexInfo& a, const OwnedDexInfo& b) { return a.index < b.index; });
+
+        std::string json = "{\n  \"package\":\"";
+        jsonEscapeAppend(&json, pkg);
+        json += "\",\n  \"filter\":\"owned-dex\",\n  \"slots\":[\n";
+        for (size_t i = 0; i < slots.size(); ++i) {
+            const OwnedDexInfo& s = slots[i];
+            json += "    {\"index\":";
+            json += std::to_string(s.index);
+            json += ",\"size\":";
+            json += std::to_string(static_cast<unsigned long long>(s.size));
+            json += ",\"checksum\":";
+            json += std::to_string(s.checksum);
+            json += ",\"compact\":";
+            json += s.compact ? "true" : "false";
+            json += ",\"java_assigned\":";
+            json += s.java_assigned ? "true" : "false";
+            json += ",\"pkg_match\":";
+            json += pathContainsPackage(s.location, pkg) ? "true" : "false";
+            json += ",\"inmemory\":";
+            json += isInMemoryDexLocation(s.location) ? "true" : "false";
+            json += ",\"kind\":\"";
+            jsonEscapeAppend(&json, sanitizeKind(s.kind.empty()
+                ? inferKind(s.source, s.location) : s.kind));
+            json += "\",\"begin\":\"";
+            jsonEscapeAppend(&json, s.begin_hex);
+            json += "\",\"location\":\"";
+            jsonEscapeAppend(&json, s.location);
+            json += "\",\"source\":\"";
+            jsonEscapeAppend(&json, s.source);
+            json += "\"}";
+            if (i + 1 < slots.size()) {
+                json += ",";
+            }
+            json += "\n";
+        }
+        json += "  ]\n}\n";
+
+        std::string path = cyrus_dir + "/dex_manifest.json";
+        int fp = open(path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0666);
+        if (fp >= 0) {
+            ssize_t w = write(fp, json.data(), json.size());
+            (void)w;
+            fsync(fp);
+            close(fp);
+            LOG(INFO) << "[owned-manifest] wrote " << path << " slots=" << slots.size();
+        } else {
+            LOG(ERROR) << "[owned-manifest] open failed " << path << " errno=" << errno;
+        }
+
+        std::vector<std::pair<const uint8_t*, OwnedDexInfo>> pending;
+        {
+            std::lock_guard<std::mutex> lock(g_fart_mutex);
+            pending.reserve(g_owned_dex_map.size());
+            for (const auto& kv : g_owned_dex_map) {
+                pending.push_back(kv);
+            }
+        }
+        for (const auto& p : pending) {
+            dumpDexToCyrus(p.first, p.second.size, p.second.index, p.second.kind, nullptr);
+        }
     }
 
     // 将所有已收集的修复缓冲区写入 *_dex_file_fix.dex 文件
@@ -491,24 +1005,38 @@ namespace art {
 
 
 
-        std::string cyrus_dir = std::string("/data/data/") + szProcName + "/cyrus_" + szProcName;
+        std::string pkg = packageFromProcName(szProcName);
+        std::string cyrus_dir = std::string("/data/data/") + pkg + "/cyrus_" + pkg;
         std::string fix_dir = cyrus_dir + "/fix";
 
         // 在锁内拷贝需要写出的数据，避免持锁期间做文件 I/O
-        struct FixEntry { int size_int; int counter; std::vector<uint8_t> buf; };
+        struct FixEntry { int size_int; int counter; std::string kind; std::vector<uint8_t> buf; };
         std::vector<FixEntry> entries;
         {
             std::lock_guard<std::mutex> lock(g_fart_mutex);
             for (auto& kv : g_dex_fix_buffers) {
                 auto it = g_dex_counter_map.find(kv.first);
                 if (it == g_dex_counter_map.end() || kv.second.empty()) continue;
-                entries.push_back({static_cast<int>(kv.second.size()), it->second, kv.second});
+                std::string kind = "auto";
+                auto oit = g_owned_dex_map.find(kv.first);
+                if (oit != g_owned_dex_map.end()) {
+                    kind = sanitizeKind(oit->second.kind.empty()
+                        ? inferKind(oit->second.source, oit->second.location)
+                        : oit->second.kind);
+                }
+                entries.push_back({static_cast<int>(kv.second.size()), it->second, kind, kv.second});
             }
         }
 
         for (auto& e : entries) {
             std::string fix_path = fix_dir + "/" + std::to_string(e.size_int) + "_" +
                                    std::to_string(e.counter) + "_dex_file_fix.dex";
+            std::string kind_fix_dir = fix_dir + "/" + e.kind;
+            ensure_dir_exists(fix_dir);
+            ensure_dir_exists(kind_fix_dir);
+            char kind_name[128];
+            snprintf(kind_name, sizeof(kind_name), "%03d_%d_dex_file_fix.dex", e.counter, e.size_int);
+            std::string kind_fix_path = kind_fix_dir + "/" + kind_name;
             int fp = open(fix_path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0666);
             if (fp >= 0) {
               ssize_t w = write(fp, e.buf.data(), e.buf.size());
@@ -517,7 +1045,8 @@ namespace art {
               }
               fsync(fp);
               close(fp);
-              LOG(INFO) << "[flushFixedDex] written: " << fix_path;
+              writeAllBytes(kind_fix_path, e.buf.data(), e.buf.size());
+              LOG(INFO) << "[flushFixedDex] written: " << kind_fix_path;
             } else {
                 LOG(ERROR) << "[flushFixedDex] open failed: " << fix_path << ", errno=" << errno;
             }

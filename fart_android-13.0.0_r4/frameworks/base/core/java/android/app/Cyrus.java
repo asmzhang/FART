@@ -16,18 +16,26 @@ public class Cyrus {
     private static boolean dumpEnabled = false;
     private static boolean fixEnabled = false;
     private static int sleepTimeMs = 60 * 1000;
+    //add
+    private static boolean scanParents = false;
+    private static boolean extraLoaders = true;
+    private static String packageName = "";
+    //add end
     private static List<Pattern> forceCallClassPatterns = new ArrayList<>();
     private static List<Pattern> ignoredClassPatterns = new ArrayList<>();
 
     /**
      * 初始化 Cyrus 配置
      * 从 /data/data/{packageName}/cyrus.config 读取配置项：
-     * dump, sleep, force, ignore
+     * dump, sleep, force, ignore, is_fix, scan_parents, extra_loaders
      *
      * @param packageName 应用包名
      */
     public static void init(@NonNull String packageName) {
         if (initialized) return;
+        //add
+        Cyrus.packageName = packageName;
+        //add end
 
         File configFile = new File("/data/data/" + packageName + "/cyrus.config");
         if (!configFile.exists()) {
@@ -57,7 +65,13 @@ public class Cyrus {
                     for (String part : parts) {
                         ignoredClassPatterns.add(Pattern.compile(convertToRegex(part)));
                     }
+                //add
+                } else if (line.startsWith("scan_parents=")) {
+                    scanParents = line.substring(13).equalsIgnoreCase("true");
+                } else if (line.startsWith("extra_loaders=")) {
+                    extraLoaders = line.substring(14).equalsIgnoreCase("true");
                 }
+                //add end
             }
         } catch (Exception e) {
             Log.e(TAG, "Failed to read config: " + e.getMessage(), e);
@@ -81,6 +95,28 @@ public class Cyrus {
     public static boolean isFixEnabled() {
         return fixEnabled;
     }
+
+    //add
+    @NonNull
+    public static String getPackageName() {
+        return packageName != null ? packageName : "";
+    }
+
+    /**
+     * 是否沿父 ClassLoader 链主动调用。默认 false：父链常是 framework，会灌系统方法。
+     */
+    public static boolean shouldScanParents() {
+        return scanParents;
+    }
+
+    /**
+     * 是否收集 split / ApplicationLoaders / 线程 CCL / 各 Application 的 ClassLoader。
+     * 默认 true：内存 DEX、插件、壳二次加载器大多不在主 PathClassLoader 上。
+     */
+    public static boolean shouldIncludeExtraLoaders() {
+        return extraLoaders;
+    }
+    //add end
 
     /**
      * 获取脱壳前的延迟休眠时间（毫秒）
