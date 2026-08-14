@@ -38,9 +38,10 @@
 namespace art {
 
     //add
-    // <clinit> 必须走 CodeItem 捕获（traceMethodCode），不能只用整包 DEX 一次性 dump：
-    // 加固壳常在 Execute 入口才解开 body，整包快照会漏掉后续 clinit。
+    // <clinit> 必须走 CodeItem 捕获（traceMethodCode），不能只用整包 DEX 一次性 dump。
+    // AOSP 13 热路径多半是 nterp，真正窗口在 ArtMethod::Invoke 退出；此处覆盖 C++ 解释器。
     extern "C" void traceMethodCode(ArtMethod* artmethod);
+    extern "C" bool fartDumpEnabled();
     //add end
 
 namespace interpreter {
@@ -270,14 +271,19 @@ static inline JValue Execute(
     bool stay_in_interpreter = false,
     bool from_deoptimize = false) REQUIRES_SHARED(Locks::mutator_lock_) {
   //add
-  // <clinit> decrypt window — capture ArtMethod CodeItem into *_ins_*.bin
-  // 用 IsClassInitializer()，禁止 PrettyMethod()+strstr：每个进 Execute 的方法都会跑到这里。
-  {
-    ArtMethod* execute_method = shadow_frame.GetMethod();
-    if (UNLIKELY(execute_method != nullptr && execute_method->IsClassInitializer())) {
-      traceMethodCode(execute_method);
+  // <clinit>：入口常是 return-void / 打孔体；壳多在解释过程中解密。
+  // 只在退出 dump（含 JIT 早退 / 异常 return）。入口 dump 会把打孔体锁进
+  // dumped set，解密后的真体再也写不进去。禁止 PrettyMethod()+strstr。
+  struct FartClinitDumpScope {
+    ArtMethod* method_;
+    explicit FartClinitDumpScope(ArtMethod* m) : method_(m) {}
+    ~FartClinitDumpScope() {
+      if (UNLIKELY(fartDumpEnabled() && method_ != nullptr && method_->IsClassInitializer())) {
+        traceMethodCode(method_);
+      }
     }
-  }
+  };
+  FartClinitDumpScope fart_clinit(shadow_frame.GetMethod());
   //add end
 
   DCHECK(!shadow_frame.GetMethod()->IsAbstract());
@@ -317,7 +323,12 @@ static inline JValue Execute(
       }
     }
 
-    if (!stay_in_interpreter && !self->IsForceInterpreter()) {
+    if (!stay_in_interpreter && !self->IsForceInterpreter()
+        //add
+        && (shadow_frame.GetMethod() == nullptr ||
+            !shadow_frame.GetMethod()->IsClassInitializer())
+        //add end
+        ) {
       jit::Jit* jit = Runtime::Current()->GetJit();
       if (jit != nullptr) {
         jit->MethodEntered(self, shadow_frame.GetMethod());

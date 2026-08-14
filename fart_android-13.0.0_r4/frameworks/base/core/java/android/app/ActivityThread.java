@@ -6682,6 +6682,14 @@ public final class ActivityThread extends ClientTransactionHandler
         final ContextImpl appContext = ContextImpl.createAppContext(this, data.info);
         mConfigurationController.updateLocaleListFromAppContext(appContext);
 
+        //add
+        // 必须在 Application.onCreate 之前打开 native dump，才能抓住启动期 <clinit>。
+        if (!Process.isIsolated()) {
+            Cyrus.init(appContext.getPackageName());
+            CyrusDump.setDumpEnabled(Cyrus.isDumpEnabled());
+        }
+        //add end
+
         // Initialize the default http proxy in this process.
         Trace.traceBegin(Trace.TRACE_TAG_ACTIVITY_MANAGER, "Setup proxies");
         try {
@@ -8171,7 +8179,9 @@ public final class ActivityThread extends ClientTransactionHandler
 
         Class resultclass = null;
         try {
-            resultclass = appClassloader.loadClass(eachclassname);
+            //add
+            resultclass = CyrusDump.loadInspectClass(appClassloader, eachclassname);
+            //add end
         } catch (VerifyError e) {
             // 类字节码校验失败（常见于加固壳未正确还原），不打印堆栈避免日志噪声
             Log.w("ActivityThread", "[dispatchClassTask] VerifyError loading: " + eachclassname);
@@ -8276,6 +8286,7 @@ public final class ActivityThread extends ClientTransactionHandler
                 if (Cyrus.isDumpEnabled()) {
 
                     //add
+                    CyrusDump.setDumpEnabled(true);
                     // 休眠前先登记应用 DEX 槽位，使 sleep 期间的 <clinit>/Execute 不再灌系统 DEX
                     registerOwnedAppDexes("pre-sleep");
                     //add end

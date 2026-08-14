@@ -33,6 +33,7 @@ sleep	10000	启动后延迟多少毫秒再脱壳（建议 5000~30000，等待壳
 force	com.example.*	只主动调用匹配的类（支持 * 通配符，逗号分隔）
 ignore	com.example.stub.*	跳过匹配的类，其余全部主动调用
 is_fix	true	将捕获到的 CodeItem 回写到内存缓冲区，结束时写出 *_dex_file_fix.dex
+init_classes	true	默认 true。巡检用 Class.forName(name,true,cl) 跑 clinit；false 则只 loadClass（不初始化）
 
 示例（精确控制）：
 
@@ -101,7 +102,8 @@ adb pull /data/data/<目标包名>/  ./dump_output/
 sleep 时间需根据壳的解密速度调整，太短会导致壳未完全解密就开始 dump
 不写 force 也不写 ignore 时，默认对所有类主动调用
 force 和 ignore 同时存在时，force 优先（见 Cyrus.java）
-反射主动调用拿不到 <clinit>，类初始化体依赖 Execute 钩子（见下节）
+adb push 配置后若 log 报 EACCES：ROM 会 restorecon 再读一次；仍失败则 chown 到应用 uid 后再 restorecon
+反射主动调用拿不到 <clinit>；巡检默认 forName 初始化类，CodeItem 在 ArtMethod::Invoke 退出时写入（见下节）
 
 
 ------------------------------------------------------------
@@ -130,14 +132,24 @@ android-13.0.0_r4：<clinit> CodeItem 捕获（本地补丁）
   https://android.googlesource.com/platform/art/+/refs/tags/android-13.0.0_r4/runtime/art_method.cc
 
 行为
-  1. Execute 入口：IsClassInitializer() 为真时调用 traceMethodCode
-     （禁止 PrettyMethod()+strstr；热路径不写整包 DEX，只写合法 CodeItem）
-  2. 整包 DEX 由 Java 登记 / flushManifest 在 JNI 线程写出（kind 目录 + 扁平副本）
-  3. traceMethodCode：按 (dex_begin, method_idx) 去重后追加写 *_ins_*.bin；
+  1. dump=true 才打开 native 热路径（setFartDumpEnabled）。无配置的应用不会写 ins。
+     在 Application.makeApplication / onCreate 之前启用，才能抓住启动期 <clinit>。
+  2. ArtMethod::Invoke 退出：IsClassInitializer() 时 traceMethodCode。
+     AOSP 13 热路径是 nterp/quick stub，C++ Execute 经常进不去；这是 <clinit>
+     的主窗口（与 Frida 钩 Invoke leave 相同）。主动 dump 短路（g_fart_trace_active）
+     不走这条，避免把未执行的占位体锁进 dumped set。
+  3. Execute 仅退出 dump（RAII 析构；禁止入口 dump）。<clinit> 禁止从 C++ 解释器
+     跳 compiled 占位。禁止 PrettyMethod()+strstr。热路径不写整包 DEX。
+  4. 整包 DEX 由 Java 登记 / flushManifest 在 JNI 线程写出（kind 目录 + 扁平副本）
+  5. 巡检默认 Class.forName(name, true, cl) 跑 <clinit>（loadClass 只链接不初始化）。
+     init_classes=false 可关掉。getDeclaredMethods 仍然拿不到 <clinit>。
+  6. traceMethodCode：按 (dex_begin, method_idx) 去重后追加写 *_ins_*.bin；
+     仅 <clinit> 占位/打孔体（insns≤1、len≤18、return-void、const/4+return、高零比）
+     不写、不进集，解密后可再进。
      is_fix 缓冲区在 nativeSetFixEnabled 时按 owned DEX 预填，热路径只 memcpy CodeItem
-  4. 仅对 <clinit>：若像占位体（insns≤1 或 code_item_len≤18，常见 return-void）
-     则不写、不进集，避免把假窗口锁死；普通主动调用路径不受影响
-  5. CodeItem 追加路径不做 fsync；越界/损坏 handler 的 CodeItem 丢弃不写
+  7. CodeItem 追加路径不做 fsync；越界/损坏 handler 的 CodeItem 丢弃不写
+  8. cyrus.config：打开失败时 SELinux.restorecon 再读；兼容 /data/data 与 /data/user/0
+  9. 结束时写出 dump_stats.json（clinit_written / placeholder_skipped）和 inspect_stats.txt
 
 编译 / 刷机
   将 overlay 覆盖进完整 AOSP 树对应路径后整编。android-13 带公开类
@@ -150,19 +162,26 @@ android-13.0.0_r4：<clinit> CodeItem 捕获（本地补丁）
   lunch aosp_redfin-userdebug
   m
 
-  不设就编不过 framework。不要改 current.txt，dump ROM 用关检查即可。
+  本轮同时改了 ART（libart / ART apex）和 framework / libcore。
+  只推 framework.jar 不够：没有 Invoke 退出钩子，巡检跑了 <clinit> 也写不进 ins.bin。
+  增量可先 m libart 再 m framework，AOSP 13 的 ART 在 com.android.art apex 里，
+  整机 m + 刷 boot/system/apex 更稳。不要改 current.txt，dump ROM 用关检查即可。
 
 刷机后验证
-  # 清旧产物再跑目标包
+  # 清旧产物再跑目标包（不必再挂 Frida）
   rm -rf /data/data/<包名>/cyrus_*
   # 跑完后：
+  cat /data/data/<包名>/cyrus_*/dump_stats.json
+  cat /data/data/<包名>/cyrus_*/inspect_stats.txt
   grep "<clinit>" /data/data/<包名>/cyrus_*/*_ins_*.bin
-  # 记录里 code_item_len 应明显大于 18；仍为 0 说明窗口不对或类未加载
+  # dump_stats.clinit_written 应明显大于 0；记录里 code_item_len 应大于 18
+  # 仍为 0 说明 dump 没打开、类没初始化、或仍是占位体
 
-限制（刷机也解不了）
-  - 只捕获实际跑过的 <clinit>；未加载类需 Class.forName / 业务路径触发
-  - 若解密发生在解释若干指令之后，入口 dump 仍空，需改钩点
-  - oat/JIT 不进解释器则无此钩子，必要时 -Xint / force interpreter
+限制
+  - 只捕获实际跑过的 <clinit>（forName 初始化 / 业务路径会跑；已初始化的类不会再跑）
+  - 解密若发生在 Invoke 返回之后（ClassLinker 尾部），退出 dump 仍空，再钩 InitializeClass
+  - init_classes=true 会执行类静态初始化，个别类 ExceptionInInitializerError 记入 inspect_fail
+  - 广告/动态 DEX 里 ClassNotFound 的方法仍可能打孔，不是 VMP 缺口
   - traceDexExecution 仍保留但 Execute 不再调用（死代码，可留可删）
 
 

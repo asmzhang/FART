@@ -528,10 +528,46 @@ namespace art {
     thread_local bool g_fart_trace_active = false;
     // FART: CodeItem 方法级去重（dex_begin + method_idx），避免 Execute/<clinit> 重复写 ins.bin
     static std::set<std::pair<const uint8_t*, uint32_t>> g_dumped_method_set;
+    // FART: dump=true 才开 Invoke/Execute 热路径写盘，避免无配置应用落 ins
+    static std::atomic<bool> g_fart_dump_enabled{false};
+    static std::atomic<uint64_t> g_fart_codeitem_written{0};
+    static std::atomic<uint64_t> g_fart_clinit_written{0};
+    static std::atomic<uint64_t> g_fart_clinit_placeholder{0};
     // FART fix: 是否启用内存修复DEX功能（将CodeItem回写生成修复后的DEX）
     static std::atomic<bool> g_fart_fix_enabled{false};
     // FART fix: DEX起始地址 → 可写缓冲区（受 g_fart_mutex 保护）
     static std::map<const uint8_t*, std::vector<uint8_t>> g_dex_fix_buffers;
+
+    extern "C" bool fartDumpEnabled() {
+        return g_fart_dump_enabled.load(std::memory_order_relaxed);
+    }
+
+    extern "C" void setFartDumpEnabled(bool enabled) {
+        g_fart_dump_enabled.store(enabled, std::memory_order_relaxed);
+        LOG(INFO) << "[setFartDumpEnabled] dump " << (enabled ? "enabled" : "disabled");
+    }
+
+    static bool looksClinitPlaceholder(const uint8_t* item, uint32_t insns_units, int code_item_len) {
+        if (insns_units <= 1u || (code_item_len > 0 && code_item_len <= 18)) {
+            return true;
+        }
+        const uint16_t* insns = reinterpret_cast<const uint16_t*>(item + 16);
+        if ((insns[0] & 0xffu) == 0x0eu) {
+            return true;
+        }
+        if (insns_units >= 2u && insns[0] == 0x0012u &&
+            (insns[1] == 0x0011u || insns[1] == 0x000fu)) {
+            return true;
+        }
+        const uint32_t cap = insns_units < 16u ? insns_units : 16u;
+        uint32_t zeros = 0;
+        for (uint32_t i = 0; i < cap; ++i) {
+            if (insns[i] == 0) {
+                ++zeros;
+            }
+        }
+        return cap >= 4u && zeros * 4u >= cap * 3u;
+    }
 
     extern "C" void traceDexExecution(ArtMethod* artmethod) REQUIRES_SHARED(Locks::mutator_lock_) {
             char szCmdline[64] = {0};
@@ -643,6 +679,9 @@ namespace art {
             if (artmethod == nullptr) {
                 return;
             }
+            if (!g_fart_dump_enabled.load(std::memory_order_relaxed)) {
+                return;
+            }
             const DexFile* dex_file = artmethod->GetDexFile();
             if (dex_file == nullptr || dex_file->Begin() == nullptr) {
                 return;
@@ -693,24 +732,22 @@ namespace art {
                     return;
                 }
 
-                // 仅 <clinit>：掏空/占位体（常见 return-void）不写、不进集，避免锁死假窗口。
-                if (artmethod->IsClassInitializer()) {
-                    const uint32_t insns_units = accessor.InsnsSizeInCodeUnits();
-                    const bool looks_placeholder =
-                        (insns_units <= 1u) ||
-                        (code_item_len > 0 && code_item_len <= 18);
-                    if (looks_placeholder) {
+                const bool is_clinit = artmethod->IsClassInitializer();
+                // 仅 <clinit>：占位/打孔体不写、不进集，解密后的真体才能进。
+                if (is_clinit) {
+                    if (looksClinitPlaceholder(item, accessor.InsnsSizeInCodeUnits(), code_item_len)) {
+                        g_fart_clinit_placeholder.fetch_add(1, std::memory_order_relaxed);
                         return;
                     }
                 }
 
-                // 进集后再写盘，避免并发双写；占位 clinit 已在上面返回，解密后仍可再进。
                 {
                     std::lock_guard<std::mutex> lock(g_fart_mutex);
-                    if (g_dumped_method_set.count(std::make_pair(begin_, method_idx)) > 0) {
+                    auto key = std::make_pair(begin_, method_idx);
+                    if (g_dumped_method_set.count(key) > 0) {
                         return;
                     }
-                    g_dumped_method_set.insert(std::make_pair(begin_, method_idx));
+                    g_dumped_method_set.insert(key);
                 }
 
                 pid_t tid = gettidv1();
@@ -769,6 +806,10 @@ namespace art {
 
                     // clinit 热路径：不做 fsync，降低 mutator 下卡顿/ANR 风险
                     close(fp2);
+                    g_fart_codeitem_written.fetch_add(1, std::memory_order_relaxed);
+                    if (is_clinit) {
+                        g_fart_clinit_written.fetch_add(1, std::memory_order_relaxed);
+                    }
 
                     // Fix DEX: 将真实 CodeItem 指令回写到内存缓冲区
                     if (g_fart_fix_enabled.load()) {
@@ -960,6 +1001,16 @@ namespace art {
             LOG(INFO) << "[owned-manifest] wrote " << path << " slots=" << slots.size();
         } else {
             LOG(ERROR) << "[owned-manifest] open failed " << path << " errno=" << errno;
+        }
+        {
+            std::string stats = "{\n  \"codeitem_written\":";
+            stats += std::to_string(g_fart_codeitem_written.load());
+            stats += ",\n  \"clinit_written\":";
+            stats += std::to_string(g_fart_clinit_written.load());
+            stats += ",\n  \"clinit_placeholder_skipped\":";
+            stats += std::to_string(g_fart_clinit_placeholder.load());
+            stats += "\n}\n";
+            writeAllBytes(cyrus_dir + "/dump_stats.json", stats.data(), stats.size());
         }
 
         std::vector<std::pair<const uint8_t*, OwnedDexInfo>> pending;
@@ -1329,6 +1380,20 @@ void ArtMethod::Invoke(Thread* self, uint32_t* args, uint32_t args_size, JValue*
     traceMethodCode(this);
     return;
   }
+  // AOSP 13 默认 nterp / quick stub，C++ Execute 经常进不去。
+  // <clinit> 必须在 Invoke 返回后 dump（与 Frida leave 同窗口）。
+  // dump=false 时只读 atomic，不碰 IsClassInitializer。
+  struct FartClinitInvokeDump {
+    ArtMethod* method_;
+    explicit FartClinitInvokeDump(ArtMethod* m) : method_(m) {}
+    ~FartClinitInvokeDump() {
+      if (UNLIKELY(method_ != nullptr)) {
+        traceMethodCode(method_);
+      }
+    }
+  };
+  FartClinitInvokeDump fart_clinit_invoke(
+      (fartDumpEnabled() && IsClassInitializer()) ? this : nullptr);
   // add end
 
   if (UNLIKELY(__builtin_frame_address(0) < self->GetStackEnd())) {

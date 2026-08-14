@@ -720,6 +720,8 @@ public final class DexFile {
 
     //add
     private static native void nativeDumpCode(Object m);
+    /** dump=true 时打开 Invoke/Execute 热路径写 CodeItem */
+    static native void nativeSetDumpEnabled(boolean enabled);
     /** 通知 native 层是否启用修复DEX模式 */
     static native void nativeSetFixEnabled(boolean enabled);
     /** 将所有已修复的DEX缓冲区写入 *_dex_file_fix.dex 文件 */

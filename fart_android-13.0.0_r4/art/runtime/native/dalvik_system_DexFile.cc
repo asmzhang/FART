@@ -69,6 +69,7 @@ namespace art {
 
     extern "C" void callNativeMethodInspector(ArtMethod* artmethod);
     extern "C" ArtMethod* convertToArtMethodPtr(JNIEnv* env, jobject javaMethod);
+    extern "C" void setFartDumpEnabled(bool enabled);
     extern "C" void setFartFixEnabled(bool enabled);
     extern "C" void flushFixedDex();
     extern "C" int fartRegisterOwnedDex(const void* dex_file, int force_index, const char* source);
@@ -79,6 +80,10 @@ namespace art {
             ArtMethod* proxy_method = convertToArtMethodPtr(env, method);
             callNativeMethodInspector(proxy_method);
         }
+    }
+
+    static void DexFile_nativeSetDumpEnabled(JNIEnv*, jclass, jboolean enabled) {
+        setFartDumpEnabled(enabled == JNI_TRUE);
     }
 
     static void DexFile_nativeSetFixEnabled(JNIEnv*, jclass, jboolean enabled) {
@@ -1047,6 +1052,7 @@ static JNINativeMethod gMethods[] = {
   NATIVE_METHOD(DexFile, setTrusted, "(Ljava/lang/Object;)V"),
   //add
   NATIVE_METHOD(DexFile, nativeDumpCode, "(Ljava/lang/Object;)V"),
+  NATIVE_METHOD(DexFile, nativeSetDumpEnabled, "(Z)V"),
   NATIVE_METHOD(DexFile, nativeSetFixEnabled, "(Z)V"),
   NATIVE_METHOD(DexFile, nativeFlushFixedDex, "()V"),
   NATIVE_METHOD(DexFile, nativeRegisterOwnedDex, "(Ljava/lang/Object;ILjava/lang/String;)I"),

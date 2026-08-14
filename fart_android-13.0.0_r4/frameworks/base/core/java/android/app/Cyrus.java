@@ -1,6 +1,7 @@
 package android.app;
 
 import android.annotation.NonNull;
+import android.os.SELinux;
 import android.util.Log;
 import java.io.*;
 import java.util.*;
@@ -19,6 +20,7 @@ public class Cyrus {
     //add
     private static boolean scanParents = false;
     private static boolean extraLoaders = true;
+    private static boolean initClasses = true;
     private static String packageName = "";
     //add end
     private static List<Pattern> forceCallClassPatterns = new ArrayList<>();
@@ -27,7 +29,7 @@ public class Cyrus {
     /**
      * 初始化 Cyrus 配置
      * 从 /data/data/{packageName}/cyrus.config 读取配置项：
-     * dump, sleep, force, ignore, is_fix, scan_parents, extra_loaders
+     * dump, sleep, force, ignore, is_fix, scan_parents, extra_loaders, init_classes
      *
      * @param packageName 应用包名
      */
@@ -37,24 +39,79 @@ public class Cyrus {
         Cyrus.packageName = packageName;
         //add end
 
-        File configFile = new File("/data/data/" + packageName + "/cyrus.config");
-        if (!configFile.exists()) {
-            // Log.w(TAG, "Config file not found: " + configFile.getPath());
+        File configFile = findConfigFile(packageName);
+        if (configFile == null) {
             initialized = true;
             return;
         }
         Log.w(TAG, "Config file found: " + configFile.getPath());
-        
+
+        if (!parseConfig(configFile)) {
+            //add
+            // adb push 常留下错误 MLS（c110 vs 当前 app 的 c113），表现为 exists 但 EACCES。
+            tryRestorecon(configFile);
+            //add end
+            if (!parseConfig(configFile)) {
+                Log.e(TAG, "Failed to read config after restorecon: " + configFile.getPath());
+            }
+        }
+        Log.w(TAG, "config dump=" + dumpEnabled
+                + " sleep=" + sleepTimeMs
+                + " is_fix=" + fixEnabled
+                + " init_classes=" + initClasses
+                + " extra_loaders=" + extraLoaders
+                + " force=" + forceCallClassPatterns.size()
+                + " ignore=" + ignoredClassPatterns.size());
+
+        initialized = true;
+    }
+
+    //add
+    private static File findConfigFile(@NonNull String packageName) {
+        File[] candidates = new File[] {
+                new File("/data/data/" + packageName + "/cyrus.config"),
+                new File("/data/user/0/" + packageName + "/cyrus.config"),
+        };
+        for (File cand : candidates) {
+            if (cand.exists()) {
+                return cand;
+            }
+        }
+        return null;
+    }
+
+    private static void tryRestorecon(@NonNull File configFile) {
+        try {
+            boolean ok = SELinux.restorecon(configFile.getAbsolutePath());
+            Log.w(TAG, "restorecon " + configFile.getPath() + " -> " + ok);
+        } catch (Throwable t) {
+            Log.w(TAG, "restorecon failed: " + t);
+        }
+    }
+
+    private static boolean parseConfig(@NonNull File configFile) {
+        forceCallClassPatterns.clear();
+        ignoredClassPatterns.clear();
+        dumpEnabled = false;
+        fixEnabled = false;
+        sleepTimeMs = 60 * 1000;
+        scanParents = false;
+        extraLoaders = true;
+        initClasses = true;
         try (BufferedReader reader = new BufferedReader(new FileReader(configFile))) {
             String line;
             while ((line = reader.readLine()) != null) {
                 line = line.trim();
                 if (line.startsWith("dump=")) {
-                    dumpEnabled = line.substring(5).equalsIgnoreCase("true");
+                    dumpEnabled = line.substring(5).trim().equalsIgnoreCase("true");
                 } else if (line.startsWith("is_fix=")) {
-                    fixEnabled = line.substring(7).equalsIgnoreCase("true");
+                    fixEnabled = line.substring(7).trim().equalsIgnoreCase("true");
                 } else if (line.startsWith("sleep=")) {
-                    sleepTimeMs = Integer.parseInt(line.substring(6));
+                    try {
+                        sleepTimeMs = Integer.parseInt(line.substring(6).trim());
+                    } catch (NumberFormatException nfe) {
+                        Log.w(TAG, "bad sleep line: " + line);
+                    }
                 } else if (line.startsWith("force=")) {
                     String[] parts = line.substring(6).split(",");
                     for (String part : parts) {
@@ -65,20 +122,21 @@ public class Cyrus {
                     for (String part : parts) {
                         ignoredClassPatterns.add(Pattern.compile(convertToRegex(part)));
                     }
-                //add
                 } else if (line.startsWith("scan_parents=")) {
                     scanParents = line.substring(13).equalsIgnoreCase("true");
                 } else if (line.startsWith("extra_loaders=")) {
                     extraLoaders = line.substring(14).equalsIgnoreCase("true");
+                } else if (line.startsWith("init_classes=")) {
+                    initClasses = line.substring(13).equalsIgnoreCase("true");
                 }
-                //add end
             }
+            return true;
         } catch (Exception e) {
-            Log.e(TAG, "Failed to read config: " + e.getMessage(), e);
+            Log.e(TAG, "Failed to read config: " + configFile.getPath() + ": " + e.getMessage(), e);
+            return false;
         }
-
-        initialized = true;
     }
+    //add end
 
     /**
      * 是否启用脱壳功能
@@ -115,6 +173,15 @@ public class Cyrus {
      */
     public static boolean shouldIncludeExtraLoaders() {
         return extraLoaders;
+    }
+
+    /**
+     * 巡检时是否 Class.forName(name, true, cl) 跑 clinit。
+     * 默认 true：ClassLoader.loadClass 只链接不初始化，反射也拿不到 clinit。
+     * 初始化副作用过大时配置 init_classes=false。
+     */
+    public static boolean shouldInitClasses() {
+        return initClasses;
     }
     //add end
 

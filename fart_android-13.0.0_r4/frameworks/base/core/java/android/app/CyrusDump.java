@@ -66,6 +66,10 @@ final class CyrusDump {
         }
     }
 
+    static void setDumpEnabled(boolean enabled) {
+        invokeDexNative("nativeSetDumpEnabled", new Class[]{boolean.class}, enabled);
+    }
+
     static void setFixEnabled(boolean enabled) {
         invokeDexNative("nativeSetFixEnabled", new Class[]{boolean.class}, enabled);
     }
@@ -537,14 +541,28 @@ final class CyrusDump {
         }
     }
 
+    //add
+    /**
+     * loadClass 只链接；forName(..., true) 才会跑 clinit，Invoke 退出才能抓到解密体。
+     */
+    static Class<?> loadInspectClass(ClassLoader cl, String name) throws ClassNotFoundException {
+        if (Cyrus.shouldInitClasses()) {
+            return Class.forName(name, true, cl);
+        }
+        return cl.loadClass(name);
+    }
+    //add end
+
     private static void dispatchClassTask(ClassLoader cl, String eachclassname, Method dumpMethod) {
         if (!Cyrus.shouldForceCall(eachclassname)) {
             return;
         }
         Class<?> resultclass;
         try {
-            resultclass = cl.loadClass(eachclassname);
+            resultclass = loadInspectClass(cl, eachclassname);
+            sInspectOk++;
         } catch (Throwable t) {
+            sInspectFail++;
             writeFail("loadClass", safeName(cl), eachclassname, t);
             return;
         }
@@ -720,9 +738,13 @@ final class CyrusDump {
     }
 
     private static FileWriter sFailLog;
+    private static int sInspectOk;
+    private static int sInspectFail;
 
     private static void beginFailLog() {
         sFailLog = null;
+        sInspectOk = 0;
+        sInspectFail = 0;
         try {
             String pkg = Cyrus.getPackageName();
             if (pkg == null || pkg.length() == 0) {
@@ -739,6 +761,23 @@ final class CyrusDump {
     }
 
     private static void endFailLog() {
+        try {
+            String pkg = Cyrus.getPackageName();
+            if (pkg != null && pkg.length() > 0) {
+                File dir = new File("/data/data/" + pkg + "/cyrus_" + pkg);
+                if (dir.exists() || dir.mkdirs()) {
+                    FileWriter sw = new FileWriter(new File(dir, "inspect_stats.txt"), false);
+                    try {
+                        sw.write("loaded=" + sInspectOk + "\n");
+                        sw.write("failed=" + sInspectFail + "\n");
+                        sw.write("init_classes=" + Cyrus.shouldInitClasses() + "\n");
+                    } finally {
+                        sw.close();
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
         if (sFailLog != null) {
             try {
                 sFailLog.close();

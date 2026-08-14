@@ -21,11 +21,13 @@ FART 是 ART 环境下基于主动调用的自动化脱壳方案。
 
 当前 `fart_android-13.0.0_r4` 约定：
 
-1. `interpreter.cc`：`IsClassInitializer()` 时调用 **`traceMethodCode`**（禁止热路径 `PrettyMethod()+strstr`）。
-2. `art_method.cc`：Execute 热路径**只写 CodeItem**（越界丢弃）；整包 DEX 在 JNI 登记/flush 写出。`(dex_begin, method_idx)` 去重；占位 `<clinit>` 不进集。
-3. 主动调用仍走 `Invoke` → `traceMethodCode`，与上共用 `ins.bin`；`is_fix` 缓冲区在 `nativeSetFixEnabled` 预填。
+1. `art_method.cc`：`dump=true` 才开热路径；`ArtMethod::Invoke` **退出**时对 `IsClassInitializer()` 调 `traceMethodCode`（AOSP 13 主窗口是 nterp，不是 C++ `Execute`）。占位/打孔 `<clinit>` 不进 dumped set。结束写 `dump_stats.json`。
+2. `interpreter.cc`：C++ `Execute` **只在退出** dump；禁止入口 dump；`<clinit>` 禁止跳 JIT 占位。
+3. `CyrusDump`：巡检默认 `Class.forName(name, true, cl)`；`loadClass` 只链接不跑 clinit。`init_classes=false` 可关。写出 `inspect_stats.txt`。
+4. `ActivityThread`：在 `makeApplication` / `onCreate` **之前** `Cyrus.init` + `setDumpEnabled`，抓住启动期 clinit。
+5. `Cyrus.init`：配置 EACCES 时 `SELinux.restorecon` 再读。热路径只写 CodeItem；整包 DEX 在 JNI 登记/flush 写出。
 
-刷机前建议先用 Frida 确认解密窗口是否在 Execute 入口；验收命令见 `使用说明.txt`。
+刷机验收见 `使用说明.txt`。不必再靠 Frida 钩 Invoke。
 
 **android-13 整机编译必须关 API 检查。** `android.app.Cyrus` 是公开类，不设则 metalava 编 framework 失败。每次新开终端：
 
