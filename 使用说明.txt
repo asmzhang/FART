@@ -140,12 +140,17 @@ android-13.0.0_r4：<clinit> CodeItem 捕获（本地补丁）
   5. CodeItem 追加路径不做 fsync；越界/损坏 handler 的 CodeItem 丢弃不写
 
 编译 / 刷机
-  将上述两文件覆盖进完整 AOSP/Lineage 树对应路径后重编 ART（或含 libart 的
-  runtime apex），刷入设备。编译刷机成本高，建议先用 Frida 验证：类首次加载时
-  GetCodeItem/Execute 入口是否已是非占位明文，再决定刷 ROM。
+  将 overlay 覆盖进完整 AOSP 树对应路径后整编。android-13 带公开类
+  android.app.Cyrus，整机 m / brunch 必须先关 metalava，否则编 framework 失败。
 
-  export WITHOUT_CHECK_API=true   # 若仍带 android.app.Cyrus
-  # 再按设备树正常 brunch / m
+  每次新开终端都要 export（只对当前 shell 有效）：
+
+  export WITHOUT_CHECK_API=true
+  source build/envsetup.sh
+  lunch aosp_redfin-userdebug
+  m
+
+  不设就编不过 framework。不要改 current.txt，dump ROM 用关检查即可。
 
 刷机后验证
   # 清旧产物再跑目标包
@@ -164,17 +169,10 @@ android-13.0.0_r4：<clinit> CodeItem 捕获（本地补丁）
 ------------------------------------------------------------
 AOSP API 检查（metalava）
 ------------------------------------------------------------
-AOSP API检查机制 (metalava) 在阻止你往 android.app 里新增公开API。
-核心原因只有一句话：
-你新增了 android.app.Cyrus，AOSP认为你修改了系统公开API。
-所以它要求：
-frameworks/base/core/api/current.txt
-必须同步更新，否则 编译直接失败。
+android.app.Cyrus 是公开类，AOSP 把它当成新增 SDK API。
+不更新 frameworks/base/api/current.txt 就会 checkapi 失败。
+dump ROM 不维护 current.txt：每次编译前必须
 
-不要把类放在
-android.app
-这是 公开SDK API空间
+  export WITHOUT_CHECK_API=true
 
-直接关掉 API 检查。
-export WITHOUT_CHECK_API=true
-m
+再 source / lunch / m。新开终端、环境被清掉后都要再 export。

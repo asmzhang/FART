@@ -25,7 +25,17 @@ FART 是 ART 环境下基于主动调用的自动化脱壳方案。
 2. `art_method.cc`：Execute 热路径**只写 CodeItem**（越界丢弃）；整包 DEX 在 JNI 登记/flush 写出。`(dex_begin, method_idx)` 去重；占位 `<clinit>` 不进集。
 3. 主动调用仍走 `Invoke` → `traceMethodCode`，与上共用 `ins.bin`；`is_fix` 缓冲区在 `nativeSetFixEnabled` 预填。
 
-刷机前建议先用 Frida 确认解密窗口是否在 Execute 入口；验收命令见 `使用说明.txt`。  
+刷机前建议先用 Frida 确认解密窗口是否在 Execute 入口；验收命令见 `使用说明.txt`。
+
+**android-13 整机编译必须关 API 检查。** `android.app.Cyrus` 是公开类，不设则 metalava 编 framework 失败。每次新开终端：
+
+```
+export WITHOUT_CHECK_API=true
+source build/envsetup.sh
+lunch aosp_redfin-userdebug
+m
+```
+
 下文为上游移植长文（符号名多为旧版 `dumpArtMethod` / `dumpDexFileByExecute`），与 r13 overlay **以实际源文件为准**。
 
 关于 FART 详细介绍参考：
@@ -915,6 +925,14 @@ private static native void dumpMethodCode(Object m);
 
 
 重新编译 android 系统
+
+android-13 overlay 整机编译（`m` / `brunch`）必须先：
+
+```
+export WITHOUT_CHECK_API=true
+```
+
+每次新开终端都要设。原因：`android.app.Cyrus` 是公开类，metalava 会拦。详见 `使用说明.txt`。
 
 ```
 # 初始化编译环境

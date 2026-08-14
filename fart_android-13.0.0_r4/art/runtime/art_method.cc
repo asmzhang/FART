@@ -526,8 +526,6 @@ namespace art {
 
     // FART: 线程局部标志位，替代 self==nullptr 作为主动触发信号，避免误触发
     thread_local bool g_fart_trace_active = false;
-    // FART: 原子计数器，配合 DEX 大小生成唯一文件名，解决同尺寸 DEX 覆盖问题
-    static std::atomic<int> g_fart_dump_counter{0};
     // FART: CodeItem 方法级去重（dex_begin + method_idx），避免 Execute/<clinit> 重复写 ins.bin
     static std::set<std::pair<const uint8_t*, uint32_t>> g_dumped_method_set;
     // FART fix: 是否启用内存修复DEX功能（将CodeItem回写生成修复后的DEX）
@@ -724,9 +722,9 @@ namespace art {
                 int fp2 = open(ins_path.c_str(), O_CREAT | O_APPEND | O_RDWR, 0666);
                 int fp3 = open(kind_ins_path.c_str(), O_CREAT | O_APPEND | O_RDWR, 0666);
                 if (fp2 >= 0) {
-                    lseek(fp2, 0, SEEK_END);
+                    (void)lseek(fp2, 0, SEEK_END);
                     if (fp3 >= 0) {
-                        lseek(fp3, 0, SEEK_END);
+                        (void)lseek(fp3, 0, SEEK_END);
                     }
                     std::string header = "{name:" + artmethod->PrettyMethod() +
                                          ",method_idx:" + std::to_string(method_idx) +
@@ -741,7 +739,8 @@ namespace art {
                         LOG(ERROR) << "ArtMethod::traceMethodCode: write header failed";
                     }
                     if (fp3 >= 0) {
-                        write(fp3, header.c_str(), header.length());
+                        ssize_t wk = write(fp3, header.c_str(), header.length());
+                        (void)wk;
                     }
 
                     long outlen = 0;
@@ -752,7 +751,8 @@ namespace art {
                             LOG(ERROR) << "ArtMethod::traceMethodCode: write base64 ins failed";
                         }
                         if (fp3 >= 0) {
-                            write(fp3, base64result, outlen);
+                            ssize_t wk = write(fp3, base64result, outlen);
+                            (void)wk;
                         }
                         free(base64result);
                     }
@@ -762,7 +762,8 @@ namespace art {
                         LOG(ERROR) << "ArtMethod::traceMethodCode: write tail failed";
                     }
                     if (fp3 >= 0) {
-                        write(fp3, "};", 2);
+                        ssize_t wk = write(fp3, "};", 2);
+                        (void)wk;
                         close(fp3);
                     }
 
