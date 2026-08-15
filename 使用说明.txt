@@ -33,7 +33,7 @@ sleep	10000	启动后延迟多少毫秒再脱壳（建议 5000~30000，等待壳
 force	com.example.*	只主动调用匹配的类（支持 * 通配符，逗号分隔）
 ignore	com.example.stub.*	跳过匹配的类，其余全部主动调用
 is_fix	true	将捕获到的 CodeItem 回写到内存缓冲区，结束时写出 *_dex_file_fix.dex
-init_classes	true	默认 true。巡检用 Class.forName(name,true,cl) 跑 clinit；false 则只 loadClass（不初始化）
+init_classes	true	默认 true。DexFile.defineClass 之后 forName(...,true) 跑 clinit；false 则只定义/链接，不初始化
 
 示例（精确控制）：
 
@@ -107,6 +107,39 @@ adb push 配置后若 log 报 EACCES：ROM 会 restorecon 再读一次；仍失�
 
 
 ------------------------------------------------------------
+和原包方法体对齐（jianjing PRE）
+------------------------------------------------------------
+parity（fart_clinit_parity.json）相对 PRE：
+
+  only_pre=0              原包方法都在 dump 里
+  zeroed_vs_pre=1698      dump 是洞、PRE 有真体
+                          约 1658 个 <clinit> + 40 个广告/OAID
+  sha_mismatch≈51402      两边都有体、字节不同（运行时常量池 ≠ PRE）
+  only_candidate=29       dump 多出来的方法
+  外形                    3 DEX、无壳 SO、na.czl 已与 PRE 相同
+
+FART ROM 能补的：
+  <clinit>  刷本 overlay。AOSP 13 ClassLinker::InitializeClass 只有
+            clinit->Invoke(self, nullptr, 0, &result, "V")
+            （art/runtime/class_linker.cc，tag android-13.0.0_r4）。
+            不要 overlay class_linker.cc。钩子在 ArtMethod::Invoke 退出
+            + Execute 退出 + 巡检后 nativeDumpClassInitializer。
+  广告 40   ROM 补不出。PRE 同样没有 SwipeRefreshLayout / UMP / OAID
+            接口的 class_def。从 PRE 写回 CodeItem。
+  sha_mismatch  不是打孔，不要整包用 PRE 覆盖（id 对不齐会 VerifyError）。
+
+刷机后看 dump_stats.clinit_written >> 0。剩下 zeroed 从 PRE 写回。
+
+AOSP 13 基线（缺文件时拉单文件再叠本目录补丁）：
+  https://android.googlesource.com/platform/art/+/refs/tags/android-13.0.0_r4/runtime/art_method.cc
+  https://android.googlesource.com/platform/art/+/refs/tags/android-13.0.0_r4/runtime/interpreter/interpreter.cc
+  https://android.googlesource.com/platform/art/+/refs/tags/android-13.0.0_r4/runtime/class_linker.cc
+  https://android.googlesource.com/platform/art/+/refs/tags/android-13.0.0_r4/runtime/native/dalvik_system_DexFile.cc
+  https://android.googlesource.com/platform/libcore/+/refs/tags/android-13.0.0_r4/dalvik/src/main/java/dalvik/system/DexFile.java
+  https://android.googlesource.com/platform/frameworks/base/+/refs/tags/android-13.0.0_r4/core/java/android/app/ActivityThread.java
+
+
+------------------------------------------------------------
 android-13.0.0_r4：<clinit> CodeItem 捕获（本地补丁）
 ------------------------------------------------------------
 
@@ -141,15 +174,23 @@ android-13.0.0_r4：<clinit> CodeItem 捕获（本地补丁）
   3. Execute 仅退出 dump（RAII 析构；禁止入口 dump）。<clinit> 禁止从 C++ 解释器
      跳 compiled 占位。禁止 PrettyMethod()+strstr。热路径不写整包 DEX。
   4. 整包 DEX 由 Java 登记 / flushManifest 在 JNI 线程写出（kind 目录 + 扁平副本）
-  5. 巡检默认 Class.forName(name, true, cl) 跑 <clinit>（loadClass 只链接不初始化）。
-     init_classes=false 可关掉。getDeclaredMethods 仍然拿不到 <clinit>。
+  5. 巡检对该 DEX 调 DexFile.loadClass / defineClassNative。这与 AOSP
+     PathClassLoader.findClass → DexPathList.Element.findClass →
+     DexFile.loadClassBinaryName → defineClassNative 是同一条路径；
+     Class.forName 对 PathClassLoader 也是 ClassLinker::FindClass → DefineClass。
+     按 $ 深度外部类优先并重试。init_classes=true 时再 forName 跑 <clinit>。
+     inspect_fail 必须记下 cause/suppressed：defineClass 会吞 NCDFE，
+     Java 侧只剩 Didn't find class on path。getDeclaredMethods 拿不到 <clinit>，
+     巡检成功后调 nativeDumpClassInitializer（FindClassInitializer）。
   6. traceMethodCode：按 (dex_begin, method_idx) 去重后追加写 *_ins_*.bin；
-     仅 <clinit> 占位/打孔体（insns≤1、len≤18、return-void、const/4+return、高零比）
-     不写、不进集，解密后可再进。
+     占位/打孔体（insns≤1、len≤18、return-void、const/4+return、高零比）
+     一律不写、不进集（含广告方法），解密后可再进。dump_stats 分
+     clinit_placeholder_skipped / code_placeholder_skipped。
      is_fix 缓冲区在 nativeSetFixEnabled 时按 owned DEX 预填，热路径只 memcpy CodeItem
   7. CodeItem 追加路径不做 fsync；越界/损坏 handler 的 CodeItem 丢弃不写
   8. cyrus.config：打开失败时 SELinux.restorecon 再读；兼容 /data/data 与 /data/user/0
-  9. 结束时写出 dump_stats.json（clinit_written / placeholder_skipped）和 inspect_stats.txt
+  9. 结束时写出 dump_stats.json（clinit_written / clinit_placeholder_skipped /
+     code_placeholder_skipped）和 inspect_stats.txt
 
 编译 / 刷机
   将 overlay 覆盖进完整 AOSP 树对应路径后整编。android-13 带公开类
@@ -175,13 +216,15 @@ android-13.0.0_r4：<clinit> CodeItem 捕获（本地补丁）
   cat /data/data/<包名>/cyrus_*/inspect_stats.txt
   grep "<clinit>" /data/data/<包名>/cyrus_*/*_ins_*.bin
   # dump_stats.clinit_written 应明显大于 0；记录里 code_item_len 应大于 18
+  # 广告 CNFE（Failed resolution of 父类/接口）仍会出现，从 PRE 写回那 40 个
   # 仍为 0 说明 dump 没打开、类没初始化、或仍是占位体
 
 限制
   - 只捕获实际跑过的 <clinit>（forName 初始化 / 业务路径会跑；已初始化的类不会再跑）
   - 解密若发生在 Invoke 返回之后（ClassLinker 尾部），退出 dump 仍空，再钩 InitializeClass
   - init_classes=true 会执行类静态初始化，个别类 ExceptionInInitializerError 记入 inspect_fail
-  - 广告/动态 DEX 里 ClassNotFound 的方法仍可能打孔，不是 VMP 缺口
+  - 广告/可选 SDK：父类或接口在 PRE 和 dump 里都只有 type_id 时，
+    AOSP DefineClass 失败。方法体从 PRE 写回，不要改 ART 强行 define。
   - traceDexExecution 仍保留但 Execute 不再调用（死代码，可留可删）
 
 

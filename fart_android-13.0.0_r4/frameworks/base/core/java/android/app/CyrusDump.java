@@ -11,6 +11,8 @@ import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Comparator;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -57,8 +59,9 @@ final class CyrusDump {
         try {
             List<ClassLoader> loaders = discoverAppClassLoaders(true);
             for (ClassLoader cl : loaders) {
-                inspectClassLoader(cl);
+                inspectOneLoader(cl);
             }
+            retryPendingFails();
         } catch (Throwable t) {
             Log.e(TAG, "inspectAll failed: " + t);
         } finally {
@@ -83,6 +86,16 @@ final class CyrusDump {
     }
 
     static void inspectClassLoader(ClassLoader cl) {
+        beginFailLog();
+        try {
+            inspectOneLoader(cl);
+            retryPendingFails();
+        } finally {
+            endFailLog();
+        }
+    }
+
+    private static void inspectOneLoader(ClassLoader cl) {
         if (isBootClassLoader(cl)) {
             return;
         }
@@ -503,7 +516,7 @@ final class CyrusDump {
             inspectDexFile(cl, dex, dumpMethod, getClassNameList);
         }
         for (Object cookie : h.cookies) {
-            inspectCookie(cl, cookie, dumpMethod, getClassNameList);
+            inspectCookie(cl, cookie, null, dumpMethod, getClassNameList);
         }
     }
 
@@ -512,11 +525,11 @@ final class CyrusDump {
         if (dexfile == null || !isUserDex(dexfile)) {
             return;
         }
-        inspectCookie(cl, readDexCookie(cl, dexfile), dumpMethod, getClassNameList);
+        inspectCookie(cl, readDexCookie(cl, dexfile), dexfile, dumpMethod, getClassNameList);
     }
 
-    private static void inspectCookie(ClassLoader cl, Object cookie, Method dumpMethod,
-                                      Method getClassNameList) {
+    private static void inspectCookie(ClassLoader cl, Object cookie, Object dexfile,
+                                      Method dumpMethod, Method getClassNameList) {
         if (cookie == null) {
             return;
         }
@@ -536,39 +549,160 @@ final class CyrusDump {
             writeFail("getClassNameList", safeName(cl), "", "null class list");
             return;
         }
-        for (String name : classnames) {
-            dispatchClassTask(cl, name, dumpMethod);
+        // 外部类先于内部类，defineClass 才找得到 $1 / $1$1。
+        Arrays.sort(classnames, new Comparator<String>() {
+            @Override
+            public int compare(String a, String b) {
+                int da = dollarCount(a);
+                int db = dollarCount(b);
+                if (da != db) {
+                    return da - db;
+                }
+                return a.compareTo(b);
+            }
+        });
+        ArrayList<String> failed = new ArrayList<String>();
+        for (int i = 0; i < classnames.length; i++) {
+            if (!dispatchClassTask(cl, classnames[i], dumpMethod, dexfile, cookie)) {
+                failed.add(classnames[i]);
+            }
         }
+        for (int pass = 0; pass < 2 && !failed.isEmpty(); pass++) {
+            ArrayList<String> still = new ArrayList<String>();
+            for (int i = 0; i < failed.size(); i++) {
+                String name = failed.get(i);
+                if (dispatchClassTask(cl, name, dumpMethod, dexfile, cookie)) {
+                    sInspectRetryOk++;
+                } else {
+                    still.add(name);
+                }
+            }
+            failed = still;
+        }
+        for (int i = 0; i < failed.size(); i++) {
+            sPendingFail.add(new InspectFail(cl, failed.get(i), dumpMethod, dexfile, cookie));
+        }
+    }
+
+    private static void retryPendingFails() {
+        for (int pass = 0; pass < 2 && !sPendingFail.isEmpty(); pass++) {
+            ArrayList<InspectFail> still = new ArrayList<InspectFail>();
+            for (int i = 0; i < sPendingFail.size(); i++) {
+                InspectFail p = sPendingFail.get(i);
+                if (dispatchClassTask(p.cl, p.name, p.dumpMethod, p.dexfile, p.cookie)) {
+                    sInspectRetryOk++;
+                } else {
+                    still.add(p);
+                }
+            }
+            sPendingFail.clear();
+            sPendingFail.addAll(still);
+        }
+        for (int i = 0; i < sPendingFail.size(); i++) {
+            InspectFail p = sPendingFail.get(i);
+            sInspectFail++;
+            try {
+                loadInspectClass(p.cl, p.name, p.dexfile, p.cookie);
+                writeFail("loadClass", safeName(p.cl), p.name,
+                        "null class after DexFile.defineClass+retry");
+            } catch (Throwable t) {
+                writeFail("loadClass", safeName(p.cl), p.name, t);
+            }
+        }
+        sPendingFail.clear();
+    }
+
+    private static int dollarCount(String name) {
+        int n = 0;
+        for (int i = 0; i < name.length(); i++) {
+            if (name.charAt(i) == '$') {
+                n++;
+            }
+        }
+        return n;
     }
 
     //add
     /**
-     * loadClass 只链接；forName(..., true) 才会跑 clinit，Invoke 退出才能抓到解密体。
+     * 优先对该 DEX 调 DexFile.loadClass / defineClassNative（与
+     * PathClassLoader.findClass → DexPathList → loadClassBinaryName 同一条
+     * defineClassNative）。AOSP 对 PathClassLoader 的 Class.forName 也会先走
+     * ClassLinker::FindClass → 同一 DefineClass。
+     * 单独再调一次只对「不在 pathList 上的 harvested cookie」有意义；
+     * 父类/接口缺失时两边一样失败。init_classes 时再 forName 跑 clinit。
      */
     static Class<?> loadInspectClass(ClassLoader cl, String name) throws ClassNotFoundException {
+        return loadInspectClass(cl, name, null, null);
+    }
+
+    static Class<?> loadInspectClass(ClassLoader cl, String name, Object dexfile, Object cookie)
+            throws ClassNotFoundException {
+        if (name != null) {
+            name = name.replace('/', '.');
+        }
+        Class<?> defined = defineFromDex(cl, name, dexfile, cookie);
+        if (defined != null) {
+            sInspectDefined++;
+            if (Cyrus.shouldInitClasses()) {
+                try {
+                    Class.forName(defined.getName(), true, cl);
+                } catch (Throwable ignored) {
+                }
+            }
+            return defined;
+        }
         if (Cyrus.shouldInitClasses()) {
             return Class.forName(name, true, cl);
         }
         return cl.loadClass(name);
     }
+
+    private static Class<?> defineFromDex(ClassLoader cl, String name, Object dexfile,
+                                          Object cookie) {
+        if (dexfile != null) {
+            try {
+                Method load = dexfile.getClass().getMethod(
+                        "loadClass", String.class, ClassLoader.class);
+                Object ret = load.invoke(dexfile, name, cl);
+                if (ret instanceof Class) {
+                    return (Class<?>) ret;
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        if (cookie != null) {
+            try {
+                Class<?> dexClz = Class.forName("dalvik.system.DexFile");
+                Method def = dexClz.getDeclaredMethod(
+                        "defineClassNative",
+                        String.class, ClassLoader.class, Object.class, dexClz);
+                def.setAccessible(true);
+                Object ret = def.invoke(null, name.replace('.', '/'), cl, cookie, dexfile);
+                if (ret instanceof Class) {
+                    return (Class<?>) ret;
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        return null;
+    }
     //add end
 
-    private static void dispatchClassTask(ClassLoader cl, String eachclassname, Method dumpMethod) {
+    private static boolean dispatchClassTask(ClassLoader cl, String eachclassname, Method dumpMethod,
+                                             Object dexfile, Object cookie) {
         if (!Cyrus.shouldForceCall(eachclassname)) {
-            return;
+            return true;
         }
         Class<?> resultclass;
         try {
-            resultclass = loadInspectClass(cl, eachclassname);
-            sInspectOk++;
+            resultclass = loadInspectClass(cl, eachclassname, dexfile, cookie);
         } catch (Throwable t) {
-            sInspectFail++;
-            writeFail("loadClass", safeName(cl), eachclassname, t);
-            return;
+            return false;
         }
         if (resultclass == null) {
-            return;
+            return false;
         }
+        sInspectOk++;
         try {
             Constructor<?>[] cons = resultclass.getDeclaredConstructors();
             for (Constructor<?> c : cons) {
@@ -591,6 +725,14 @@ final class CyrusDump {
             }
         } catch (Throwable ignored) {
         }
+        // getDeclaredMethods 没有 <clinit>；AOSP 用 FindClassInitializer。
+        if (sDumpClinit != null) {
+            try {
+                sDumpClinit.invoke(null, resultclass);
+            } catch (Throwable ignored) {
+            }
+        }
+        return true;
     }
 
     static boolean isUserDex(Object dexFile) {
@@ -737,14 +879,38 @@ final class CyrusDump {
         }
     }
 
+    private static final class InspectFail {
+        final ClassLoader cl;
+        final String name;
+        final Method dumpMethod;
+        final Object dexfile;
+        final Object cookie;
+
+        InspectFail(ClassLoader cl, String name, Method dumpMethod, Object dexfile, Object cookie) {
+            this.cl = cl;
+            this.name = name;
+            this.dumpMethod = dumpMethod;
+            this.dexfile = dexfile;
+            this.cookie = cookie;
+        }
+    }
+
     private static FileWriter sFailLog;
     private static int sInspectOk;
     private static int sInspectFail;
+    private static int sInspectDefined;
+    private static int sInspectRetryOk;
+    private static Method sDumpClinit;
+    private static final ArrayList<InspectFail> sPendingFail = new ArrayList<InspectFail>();
 
     private static void beginFailLog() {
         sFailLog = null;
         sInspectOk = 0;
         sInspectFail = 0;
+        sInspectDefined = 0;
+        sInspectRetryOk = 0;
+        sDumpClinit = findDexMethod(null, "nativeDumpClassInitializer");
+        sPendingFail.clear();
         try {
             String pkg = Cyrus.getPackageName();
             if (pkg == null || pkg.length() == 0) {
@@ -770,6 +936,8 @@ final class CyrusDump {
                     try {
                         sw.write("loaded=" + sInspectOk + "\n");
                         sw.write("failed=" + sInspectFail + "\n");
+                        sw.write("defined=" + sInspectDefined + "\n");
+                        sw.write("retry_ok=" + sInspectRetryOk + "\n");
                         sw.write("init_classes=" + Cyrus.shouldInitClasses() + "\n");
                     } finally {
                         sw.close();
@@ -788,8 +956,48 @@ final class CyrusDump {
     }
 
     private static void writeFail(String op, String loader, String cls, Throwable t) {
-        String msg = t == null ? "" : (t.getClass().getName() + ": " + t.getMessage());
-        writeFail(op, loader, cls, msg);
+        writeFail(op, loader, cls, formatThrowable(t));
+    }
+
+    /**
+     * AOSP DexFile.defineClass 会吞掉 NCDFE/CNFE；BaseDexClassLoader.findClass
+     * 再抛「Didn't find class on path」，真因在 cause / suppressed / CNFE.ex。
+     * Class.forName 的 native 包装用 CNFE(name, cause)，getMessage 只有类名。
+     */
+    private static String formatThrowable(Throwable t) {
+        if (t == null) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder();
+        Throwable cur = t;
+        int depth = 0;
+        while (cur != null && depth < 6) {
+            if (depth > 0) {
+                sb.append(" <= ");
+            }
+            sb.append(cur.getClass().getName()).append(": ").append(cur.getMessage());
+            Throwable[] supp = cur.getSuppressed();
+            if (supp != null) {
+                int n = supp.length < 4 ? supp.length : 4;
+                for (int i = 0; i < n; i++) {
+                    if (supp[i] != null) {
+                        sb.append(" |suppressed ").append(supp[i].getClass().getName())
+                                .append(": ").append(supp[i].getMessage());
+                    }
+                }
+            }
+            if (cur instanceof ClassNotFoundException) {
+                Throwable legacy = ((ClassNotFoundException) cur).getException();
+                Throwable cause = cur.getCause();
+                if (legacy != null && legacy != cause) {
+                    sb.append(" |legacy ").append(legacy.getClass().getName())
+                            .append(": ").append(legacy.getMessage());
+                }
+            }
+            cur = cur.getCause();
+            depth++;
+        }
+        return sb.toString();
     }
 
     private static void writeFail(String op, String loader, String cls, String msg) {

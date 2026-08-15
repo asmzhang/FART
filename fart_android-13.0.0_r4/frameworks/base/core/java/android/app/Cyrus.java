@@ -176,7 +176,7 @@ public class Cyrus {
     }
 
     /**
-     * 巡检时是否 Class.forName(name, true, cl) 跑 clinit。
+     * 巡检时是否在 DexFile.defineClass 之后 Class.forName(name, true, cl) 跑 clinit。
      * 默认 true：ClassLoader.loadClass 只链接不初始化，反射也拿不到 clinit。
      * 初始化副作用过大时配置 init_classes=false。
      */

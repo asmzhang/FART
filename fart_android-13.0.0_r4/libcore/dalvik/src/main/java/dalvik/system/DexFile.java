@@ -720,6 +720,8 @@ public final class DexFile {
 
     //add
     private static native void nativeDumpCode(Object m);
+    /** dump 已加载类的 <clinit> CodeItem（反射 getDeclaredMethods 没有它） */
+    private static native void nativeDumpClassInitializer(Class<?> c);
     /** dump=true 时打开 Invoke/Execute 热路径写 CodeItem */
     static native void nativeSetDumpEnabled(boolean enabled);
     /** 通知 native 层是否启用修复DEX模式 */

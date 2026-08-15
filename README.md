@@ -21,9 +21,9 @@ FART 是 ART 环境下基于主动调用的自动化脱壳方案。
 
 当前 `fart_android-13.0.0_r4` 约定：
 
-1. `art_method.cc`：`dump=true` 才开热路径；`ArtMethod::Invoke` **退出**时对 `IsClassInitializer()` 调 `traceMethodCode`（AOSP 13 主窗口是 nterp，不是 C++ `Execute`）。占位/打孔 `<clinit>` 不进 dumped set。结束写 `dump_stats.json`。
+1. `art_method.cc`：`dump=true` 才开热路径；`ArtMethod::Invoke` **退出**时对 `IsClassInitializer()` 调 `traceMethodCode`（AOSP 13 主窗口是 nterp，不是 C++ `Execute`）。占位/打孔体（含非 clinit）不进 dumped set。结束写 `dump_stats.json`。
 2. `interpreter.cc`：C++ `Execute` **只在退出** dump；禁止入口 dump；`<clinit>` 禁止跳 JIT 占位。
-3. `CyrusDump`：巡检默认 `Class.forName(name, true, cl)`；`loadClass` 只链接不跑 clinit。`init_classes=false` 可关。写出 `inspect_stats.txt`。
+3. `CyrusDump`：巡检对该 DEX `DexFile.loadClass`（与 PathClassLoader 同一条 DefineClass）；init 后 `nativeDumpClassInitializer` 补反射拿不到的 `<clinit>`。`inspect_fail` 写 cause/suppressed。
 4. `ActivityThread`：在 `makeApplication` / `onCreate` **之前** `Cyrus.init` + `setDumpEnabled`，抓住启动期 clinit。
 5. `Cyrus.init`：配置 EACCES 时 `SELinux.restorecon` 再读。热路径只写 CodeItem；整包 DEX 在 JNI 登记/flush 写出。
 

@@ -56,6 +56,9 @@
 #include "well_known_classes.h"
 
 //add
+#include "art_method.h"
+#include "base/enums.h"
+#include "mirror/class-inl.h"
 #include "scoped_fast_native_object_access-inl.h"
 // add end
 namespace art {
@@ -74,11 +77,30 @@ namespace art {
     extern "C" void flushFixedDex();
     extern "C" int fartRegisterOwnedDex(const void* dex_file, int force_index, const char* source);
     extern "C" void fartFlushOwnedDexManifest();
+    extern "C" void traceMethodCode(ArtMethod* artmethod);
 
     static void DexFile_nativeDumpCode(JNIEnv* env, jclass, jobject method) {
         if (method != nullptr) {
             ArtMethod* proxy_method = convertToArtMethodPtr(env, method);
             callNativeMethodInspector(proxy_method);
+        }
+    }
+
+    // Java getDeclaredMethods 不含 <clinit>。AOSP InitializeClass 用
+    // klass->FindClassInitializer()->Invoke。init 之后把当前 CodeItem 再 dump 一次
+    // （已在 dumped set 则跳过；启动期已初始化、Invoke 钩子没赶上的也能补）。
+    static void DexFile_nativeDumpClassInitializer(JNIEnv* env, jclass, jclass java_class) {
+        if (java_class == nullptr) {
+            return;
+        }
+        ScopedFastNativeObjectAccess soa(env);
+        ObjPtr<mirror::Class> klass = soa.Decode<mirror::Class>(java_class);
+        if (klass == nullptr) {
+            return;
+        }
+        ArtMethod* clinit = klass->FindClassInitializer(kRuntimePointerSize);
+        if (clinit != nullptr) {
+            traceMethodCode(clinit);
         }
     }
 
@@ -1052,6 +1074,7 @@ static JNINativeMethod gMethods[] = {
   NATIVE_METHOD(DexFile, setTrusted, "(Ljava/lang/Object;)V"),
   //add
   NATIVE_METHOD(DexFile, nativeDumpCode, "(Ljava/lang/Object;)V"),
+  NATIVE_METHOD(DexFile, nativeDumpClassInitializer, "(Ljava/lang/Class;)V"),
   NATIVE_METHOD(DexFile, nativeSetDumpEnabled, "(Z)V"),
   NATIVE_METHOD(DexFile, nativeSetFixEnabled, "(Z)V"),
   NATIVE_METHOD(DexFile, nativeFlushFixedDex, "()V"),

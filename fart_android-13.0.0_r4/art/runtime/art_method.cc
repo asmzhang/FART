@@ -533,6 +533,7 @@ namespace art {
     static std::atomic<uint64_t> g_fart_codeitem_written{0};
     static std::atomic<uint64_t> g_fart_clinit_written{0};
     static std::atomic<uint64_t> g_fart_clinit_placeholder{0};
+    static std::atomic<uint64_t> g_fart_code_placeholder{0};
     // FART fix: 是否启用内存修复DEX功能（将CodeItem回写生成修复后的DEX）
     static std::atomic<bool> g_fart_fix_enabled{false};
     // FART fix: DEX起始地址 → 可写缓冲区（受 g_fart_mutex 保护）
@@ -547,7 +548,7 @@ namespace art {
         LOG(INFO) << "[setFartDumpEnabled] dump " << (enabled ? "enabled" : "disabled");
     }
 
-    static bool looksClinitPlaceholder(const uint8_t* item, uint32_t insns_units, int code_item_len) {
+    static bool looksCodePlaceholder(const uint8_t* item, uint32_t insns_units, int code_item_len) {
         if (insns_units <= 1u || (code_item_len > 0 && code_item_len <= 18)) {
             return true;
         }
@@ -733,12 +734,15 @@ namespace art {
                 }
 
                 const bool is_clinit = artmethod->IsClassInitializer();
-                // 仅 <clinit>：占位/打孔体不写、不进集，解密后的真体才能进。
-                if (is_clinit) {
-                    if (looksClinitPlaceholder(item, accessor.InsnsSizeInCodeUnits(), code_item_len)) {
+                // 占位/打孔体不写、不进集：巡检 dumpMethod 不能把未解密广告方法锁死。
+                // 真 return-void 不依赖 ins（整包 DEX 已有）；解密后的真体才能进。
+                if (looksCodePlaceholder(item, accessor.InsnsSizeInCodeUnits(), code_item_len)) {
+                    if (is_clinit) {
                         g_fart_clinit_placeholder.fetch_add(1, std::memory_order_relaxed);
-                        return;
+                    } else {
+                        g_fart_code_placeholder.fetch_add(1, std::memory_order_relaxed);
                     }
+                    return;
                 }
 
                 {
@@ -1009,6 +1013,8 @@ namespace art {
             stats += std::to_string(g_fart_clinit_written.load());
             stats += ",\n  \"clinit_placeholder_skipped\":";
             stats += std::to_string(g_fart_clinit_placeholder.load());
+            stats += ",\n  \"code_placeholder_skipped\":";
+            stats += std::to_string(g_fart_code_placeholder.load());
             stats += "\n}\n";
             writeAllBytes(cyrus_dir + "/dump_stats.json", stats.data(), stats.size());
         }
