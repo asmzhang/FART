@@ -12,6 +12,9 @@ FART 是 ART 环境下基于主动调用的自动化脱壳方案。
 |------|------|
 | `fart6` / `fart8` / `fart10` | 历史移植对照 |
 | `fart_android-13.0.0_r4` | Android 13 当前补丁树 |
+| `tools/link_stubs.py` | 从 dump DEX 生成缺父类/接口空桩（一类问题，通用，不读 PRE） |
+
+Frida 脚本在并列仓库 `CYRUS-STUDIO-frida_fart`，**不是** ROM 编译依赖。可选：`git submodule add <frida_fart> frida`。缺 `class_def` 这类问题走 `link_stubs.py` + ROM 真调用，不要靠 Frida 抄原包。
 
 缺基线时从对应 AOSP tag **拉单文件**再叠补丁，不必把整树 sync 进本目录。
 
@@ -23,8 +26,8 @@ FART 是 ART 环境下基于主动调用的自动化脱壳方案。
 
 1. `art_method.cc`：`dump=true` 才开热路径；`ArtMethod::Invoke` **退出**时对 `IsClassInitializer()` 调 `traceMethodCode`（AOSP 13 主窗口是 nterp，不是 C++ `Execute`）。占位/打孔体（含非 clinit）不进 dumped set。结束写 `dump_stats.json`。
 2. `interpreter.cc`：C++ `Execute` **只在退出** dump；禁止入口 dump；`<clinit>` 禁止跳 JIT 占位。
-3. `CyrusDump`：巡检对该 DEX `DexFile.loadClass`（与 PathClassLoader 同一条 DefineClass）；init 后 `nativeDumpClassInitializer` 补反射拿不到的 `<clinit>`。`inspect_fail` 写 cause/suppressed。
-4. `ActivityThread`：在 `makeApplication` / `onCreate` **之前** `Cyrus.init` + `setDumpEnabled`，抓住启动期 clinit。
+3. `CyrusDump`：巡检对该 DEX `DexFile.loadClass`（与 PathClassLoader 同一条 DefineClass）；init 后 `nativeDumpClassInitializer` 补反射拿不到的 `<clinit>`。`inspect_fail` 写 cause/suppressed。缺父类/接口时把 `link_stubs.py` 生成的空桩 DEX 接到 ClassLoader 后面，对 execute 列表真 Invoke 再 dump。
+4. `ActivityThread`：在 `makeApplication` / `onCreate` **之前** `Cyrus.init` + `setDumpEnabled`，并在 dump 开启时挂上 link stubs，抓住启动期 clinit。
 5. `Cyrus.init`：配置 EACCES 时 `SELinux.restorecon` 再读。热路径只写 CodeItem；整包 DEX 在 JNI 登记/flush 写出。
 
 刷机验收见 `使用说明.txt`。不必再靠 Frida 钩 Invoke。

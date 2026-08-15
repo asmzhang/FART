@@ -22,6 +22,10 @@ public class Cyrus {
     private static boolean extraLoaders = true;
     private static boolean initClasses = true;
     private static String packageName = "";
+    private static String linkStubsPath = "";
+    private static String executeFilePath = "";
+    private static List<Pattern> executeClassPatterns = new ArrayList<>();
+    private static List<String> executeClassNames = new ArrayList<>();
     //add end
     private static List<Pattern> forceCallClassPatterns = new ArrayList<>();
     private static List<Pattern> ignoredClassPatterns = new ArrayList<>();
@@ -29,7 +33,8 @@ public class Cyrus {
     /**
      * 初始化 Cyrus 配置
      * 从 /data/data/{packageName}/cyrus.config 读取配置项：
-     * dump, sleep, force, ignore, is_fix, scan_parents, extra_loaders, init_classes
+     * dump, sleep, force, ignore, is_fix, scan_parents, extra_loaders, init_classes,
+     * link_stubs, execute, execute_file
      *
      * @param packageName 应用包名
      */
@@ -60,8 +65,18 @@ public class Cyrus {
                 + " is_fix=" + fixEnabled
                 + " init_classes=" + initClasses
                 + " extra_loaders=" + extraLoaders
+                + " link_stubs=" + linkStubsPath
+                + " execute=" + executeClassPatterns.size()
+                + " execute_names=" + executeClassNames.size()
                 + " force=" + forceCallClassPatterns.size()
                 + " ignore=" + ignoredClassPatterns.size());
+
+        if (executeClassNames.isEmpty()) {
+            String stubs = getLinkStubsPath();
+            if (stubs.endsWith(".dex")) {
+                loadExecuteFile(stubs.substring(0, stubs.length() - 4) + ".execute.txt");
+            }
+        }
 
         initialized = true;
     }
@@ -98,6 +113,10 @@ public class Cyrus {
         scanParents = false;
         extraLoaders = true;
         initClasses = true;
+        linkStubsPath = "";
+        executeFilePath = "";
+        executeClassPatterns.clear();
+        executeClassNames.clear();
         try (BufferedReader reader = new BufferedReader(new FileReader(configFile))) {
             String line;
             while ((line = reader.readLine()) != null) {
@@ -128,6 +147,20 @@ public class Cyrus {
                     extraLoaders = line.substring(14).equalsIgnoreCase("true");
                 } else if (line.startsWith("init_classes=")) {
                     initClasses = line.substring(13).equalsIgnoreCase("true");
+                } else if (line.startsWith("link_stubs=")) {
+                    linkStubsPath = line.substring(11).trim();
+                } else if (line.startsWith("execute_file=")) {
+                    executeFilePath = line.substring(13).trim();
+                    loadExecuteFile(executeFilePath);
+                } else if (line.startsWith("execute=")) {
+                    String[] parts = line.substring(8).split(",");
+                    for (String part : parts) {
+                        String p = part.trim();
+                        if (p.length() == 0) {
+                            continue;
+                        }
+                        executeClassPatterns.add(Pattern.compile(convertToRegex(p)));
+                    }
                 }
             }
             return true;
@@ -182,6 +215,54 @@ public class Cyrus {
      */
     public static boolean shouldInitClasses() {
         return initClasses;
+    }
+
+    @NonNull
+    public static String getLinkStubsPath() {
+        if (linkStubsPath != null && linkStubsPath.length() > 0) {
+            return linkStubsPath;
+        }
+        return "/data/local/tmp/fart_link_stubs.dex";
+    }
+
+    public static boolean shouldExecute(@NonNull String className) {
+        if (!executeClassPatterns.isEmpty()) {
+            for (Pattern p : executeClassPatterns) {
+                if (p.matcher(className).matches()) {
+                    return true;
+                }
+            }
+        }
+        for (int i = 0; i < executeClassNames.size(); i++) {
+            String n = executeClassNames.get(i);
+            if (className.equals(n) || className.startsWith(n + "$")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static void loadExecuteFile(String path) {
+        if (path == null || path.length() == 0) {
+            return;
+        }
+        File f = new File(path);
+        if (!f.isFile()) {
+            Log.w(TAG, "execute_file missing: " + path);
+            return;
+        }
+        try (BufferedReader reader = new BufferedReader(new FileReader(f))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                line = line.trim();
+                if (line.length() == 0 || line.startsWith("#")) {
+                    continue;
+                }
+                executeClassNames.add(line);
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "execute_file: " + e.getMessage());
+        }
     }
     //add end
 

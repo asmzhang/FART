@@ -6687,6 +6687,10 @@ public final class ActivityThread extends ClientTransactionHandler
         if (!Process.isIsolated()) {
             Cyrus.init(appContext.getPackageName());
             CyrusDump.setDumpEnabled(Cyrus.isDumpEnabled());
+            if (Cyrus.isDumpEnabled()) {
+                // Before Application.onCreate so missing super/iface can resolve.
+                CyrusDump.installLinkStubsOn(appContext.getClassLoader());
+            }
         }
         //add end
 

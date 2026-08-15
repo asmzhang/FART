@@ -25,3 +25,9 @@ hs_err_pid*
 .idea
 
 __pycache__
+tools/_stub_src/
+tools/_stub_classes/
+tools/_apk_dex/
+tools/fart_link_stubs.dex
+tools/fart_link_stubs.execute.txt
+tools/classes.dex

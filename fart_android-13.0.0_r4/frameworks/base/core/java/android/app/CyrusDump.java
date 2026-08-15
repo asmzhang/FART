@@ -10,6 +10,8 @@ import java.lang.reflect.Array;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
+import dalvik.system.PathClassLoader;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
@@ -34,6 +36,9 @@ final class CyrusDump {
     static final String KIND_CUSTOM = "custom";
     static final String KIND_INMEMORY = "inmemory";
 
+    private static final IdentityHashMap<ClassLoader, Boolean> sLinkStubInstalled =
+            new IdentityHashMap<ClassLoader, Boolean>();
+
     /** 一次完整登记：主 CL cookie 序优先，自定义加载器追加且不打乱已有槽位。 */
     static void registerAll(@NonNull String phase) {
         try {
@@ -48,6 +53,10 @@ final class CyrusDump {
             invokeDexNative("nativeFlushOwnedDexManifest", new Class[]{});
             Log.e(TAG, "registerAll phase=" + phase + " loaders=" + loaders.size()
                     + " nextSlot=" + next);
+            // After owned slots are recorded so fart_link_stubs.dex is not dumped.
+            for (int i = 0; i < loaders.size(); i++) {
+                installLinkStubs(loaders.get(i));
+            }
         } catch (Throwable t) {
             Log.e(TAG, "registerAll failed phase=" + phase + " : " + t);
         }
@@ -58,6 +67,9 @@ final class CyrusDump {
         beginFailLog();
         try {
             List<ClassLoader> loaders = discoverAppClassLoaders(true);
+            for (int i = 0; i < loaders.size(); i++) {
+                installLinkStubs(loaders.get(i));
+            }
             for (ClassLoader cl : loaders) {
                 inspectOneLoader(cl);
             }
@@ -88,6 +100,7 @@ final class CyrusDump {
     static void inspectClassLoader(ClassLoader cl) {
         beginFailLog();
         try {
+            installLinkStubs(cl);
             inspectOneLoader(cl);
             retryPendingFails();
         } finally {
@@ -688,6 +701,212 @@ final class CyrusDump {
     }
     //add end
 
+    //add
+    /**
+     * Append (not prepend) a stub DEX so missing super/iface type_ids can
+     * resolve. App class_defs stay first; stub types are only the ones dump
+     * DEX never defined. Not PRE bytecode.
+     */
+    static void installLinkStubsOn(ClassLoader cl) {
+        installLinkStubs(cl);
+    }
+
+    private static void installLinkStubs(ClassLoader cl) {
+        if (cl == null || !Cyrus.isDumpEnabled() || isBootClassLoader(cl)
+                || sLinkStubInstalled.containsKey(cl)) {
+            return;
+        }
+        String path = Cyrus.getLinkStubsPath();
+        File f = new File(path);
+        if (!f.isFile()) {
+            return;
+        }
+        try {
+            PathClassLoader stub = new PathClassLoader(path, cl.getParent());
+            Object appList = getFieldByClassName("dalvik.system.BaseDexClassLoader", cl, "pathList");
+            Object stubList = getFieldByClassName("dalvik.system.BaseDexClassLoader", stub, "pathList");
+            if (appList == null || stubList == null) {
+                Log.w(TAG, "link_stubs pathList missing loader=" + safeName(cl));
+                return;
+            }
+            Object appEls = getFieldByClassName("dalvik.system.DexPathList", appList, "dexElements");
+            Object stubEls = getFieldByClassName("dalvik.system.DexPathList", stubList, "dexElements");
+            if (!(appEls instanceof Object[]) || !(stubEls instanceof Object[])) {
+                return;
+            }
+            Object[] a = (Object[]) appEls;
+            Object[] s = (Object[]) stubEls;
+            if (s.length == 0) {
+                return;
+            }
+            if (alreadyHasStubPath(a, path)) {
+                sLinkStubInstalled.put(cl, Boolean.TRUE);
+                return;
+            }
+            Object[] merged = (Object[]) Array.newInstance(a.getClass().getComponentType(), a.length + s.length);
+            System.arraycopy(a, 0, merged, 0, a.length);
+            System.arraycopy(s, 0, merged, a.length, s.length);
+            Field els = declaredField("dalvik.system.DexPathList", "dexElements");
+            if (els == null) {
+                return;
+            }
+            els.set(appList, merged);
+            sLinkStubInstalled.put(cl, Boolean.TRUE);
+            Log.e(TAG, "link_stubs appended " + path + " elements=" + s.length
+                    + " loader=" + safeName(cl));
+        } catch (Throwable t) {
+            Log.e(TAG, "link_stubs failed: " + t);
+        }
+    }
+
+    private static boolean alreadyHasStubPath(Object[] elements, String stubPath) {
+        Field dexFileField = declaredField("dalvik.system.DexPathList$Element", "dexFile");
+        if (dexFileField == null || stubPath == null) {
+            return false;
+        }
+        for (int i = 0; i < elements.length; i++) {
+            try {
+                Object df = dexFileField.get(elements[i]);
+                if (df == null) {
+                    continue;
+                }
+                Field nf = df.getClass().getDeclaredField("mFileName");
+                nf.setAccessible(true);
+                String n = (String) nf.get(df);
+                if (stubPath.equals(n)) {
+                    return true;
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        return false;
+    }
+
+    private static void executeThenDump(Class<?> cls, Method dumpMethod) {
+        Object inst = tryAllocInstance(cls);
+        try {
+            Constructor<?>[] cons = cls.getDeclaredConstructors();
+            for (int i = 0; i < cons.length; i++) {
+                try {
+                    dumpMethod.invoke(null, cons[i]);
+                } catch (Throwable ignored) {
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        try {
+            Method[] methods = cls.getDeclaredMethods();
+            if (methods == null) {
+                return;
+            }
+            for (int i = 0; i < methods.length; i++) {
+                Method m = methods[i];
+                try {
+                    m.setAccessible(true);
+                    Object[] args = defaultArgs(m.getParameterTypes());
+                    if ((m.getModifiers() & Modifier.STATIC) != 0) {
+                        m.invoke(null, args);
+                    } else if (inst != null) {
+                        m.invoke(inst, args);
+                    }
+                } catch (Throwable ignored) {
+                }
+                try {
+                    dumpMethod.invoke(null, m);
+                } catch (Throwable ignored) {
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        if (sDumpClinit != null) {
+            try {
+                sDumpClinit.invoke(null, cls);
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    /**
+     * Inner/anonymous classes need an outer instance; dummy ctor often fails.
+     * Allocate without &lt;init&gt; so instance methods can still be invoked
+     * (packer decrypts on Invoke, even if the call then NPEs).
+     */
+    private static Object tryAllocInstance(Class<?> cls) {
+        int mods = cls.getModifiers();
+        if ((mods & Modifier.INTERFACE) != 0 || (mods & Modifier.ABSTRACT) != 0) {
+            return null;
+        }
+        try {
+            Constructor<?>[] cons = cls.getDeclaredConstructors();
+            for (int i = 0; i < cons.length; i++) {
+                Constructor<?> c = cons[i];
+                try {
+                    c.setAccessible(true);
+                    Object inst = c.newInstance(defaultArgs(c.getParameterTypes()));
+                    if (inst != null) {
+                        return inst;
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        try {
+            Class<?> u = Class.forName("sun.misc.Unsafe");
+            Object unsafe = null;
+            String[] fields = new String[] {"THE_ONE", "theUnsafe"};
+            for (int i = 0; i < fields.length && unsafe == null; i++) {
+                try {
+                    Field f = u.getDeclaredField(fields[i]);
+                    f.setAccessible(true);
+                    unsafe = f.get(null);
+                } catch (Throwable ignored) {
+                }
+            }
+            if (unsafe == null) {
+                return null;
+            }
+            Method alloc = u.getMethod("allocateInstance", Class.class);
+            return alloc.invoke(unsafe, cls);
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static Object[] defaultArgs(Class<?>[] types) {
+        Object[] args = new Object[types.length];
+        for (int i = 0; i < types.length; i++) {
+            Class<?> t = types[i];
+            if (t == boolean.class) {
+                args[i] = Boolean.FALSE;
+            } else if (t == byte.class) {
+                args[i] = Byte.valueOf((byte) 0);
+            } else if (t == short.class) {
+                args[i] = Short.valueOf((short) 0);
+            } else if (t == int.class) {
+                args[i] = Integer.valueOf(0);
+            } else if (t == long.class) {
+                args[i] = Long.valueOf(0L);
+            } else if (t == float.class) {
+                args[i] = Float.valueOf(0f);
+            } else if (t == double.class) {
+                args[i] = Double.valueOf(0d);
+            } else if (t == char.class) {
+                args[i] = Character.valueOf((char) 0);
+            } else if (t == android.content.Context.class) {
+                try {
+                    args[i] = ActivityThread.currentApplication();
+                } catch (Throwable ignored) {
+                    args[i] = null;
+                }
+            } else {
+                args[i] = null;
+            }
+        }
+        return args;
+    }
+    //add end
+
     private static boolean dispatchClassTask(ClassLoader cl, String eachclassname, Method dumpMethod,
                                              Object dexfile, Object cookie) {
         if (!Cyrus.shouldForceCall(eachclassname)) {
@@ -732,6 +951,9 @@ final class CyrusDump {
             } catch (Throwable ignored) {
             }
         }
+        if (Cyrus.shouldExecute(eachclassname)) {
+            executeThenDump(resultclass, dumpMethod);
+        }
         return true;
     }
 
@@ -760,6 +982,13 @@ final class CyrusDump {
             if (fileName.indexOf("/apex/") >= 0 ||
                     fileName.indexOf("/system/framework/") >= 0 ||
                     fileName.indexOf("boot.oat") >= 0) {
+                return false;
+            }
+            String stubPath = Cyrus.getLinkStubsPath();
+            if (stubPath.length() > 0 && stubPath.equals(fileName)) {
+                return false;
+            }
+            if (fileName.indexOf("fart_link_stubs") >= 0) {
                 return false;
             }
             return true;

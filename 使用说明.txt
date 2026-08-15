@@ -34,6 +34,34 @@ force	com.example.*	只主动调用匹配的类（支持 * 通配符，逗号分
 ignore	com.example.stub.*	跳过匹配的类，其余全部主动调用
 is_fix	true	将捕获到的 CodeItem 回写到内存缓冲区，结束时写出 *_dex_file_fix.dex
 init_classes	true	默认 true。DexFile.defineClass 之后 forName(...,true) 跑 clinit；false 则只定义/链接，不初始化
+link_stubs	/data/local/tmp/fart_link_stubs.dex	缺父类/接口时预挂的空桩 DEX（tools/link_stubs.py 从 dump DEX 生成，禁止用 PRE）
+execute_file	/data/local/tmp/fart_link_stubs.execute.txt	真调用再 dump 的类名列表（默认与 link_stubs 同名 .execute.txt）
+execute	com.foo.*	同上，通配符；dumpMethodCode 不执行，占位体要靠真 Invoke 解开
+
+缺父类/接口（一类问题，通用，不按 SDK/广告包名，不手写样本桩，不读 PRE）：
+  加固包 DEX 里 class_def 引用了只有 type_id、没有 class_def 的 super/iface 时，
+  ART DefineClass 失败，壳不会解密这些方法。Frida dumpMethodCode 同样不执行。
+  不要从原包抄 CodeItem。
+
+  两轮（换包只重跑生成器，不必改 ROM Java）：
+  1) 先按普通 dump 跑一轮，得到 cyrus_*/*_dex_file.dex（缺类型的类仍是打孔）。
+  2) 从这份 dump 生成空桩（可带 --fail inspect_fail.txt，目录里有会自动读）：
+       python tools/link_stubs.py --dex-dir <cyrus dump 目录> --out fart_link_stubs.dex --push
+     默认推到 /data/local/tmp/fart_link_stubs.dex 与同名 .execute.txt。
+  3) 清 cyrus_* 再开一次包。dump=true 时 ROM 在 Application.onCreate 之前把桩 DEX
+     **接在** 应用 ClassLoader 后面（已有 class_def 仍走 dump/壳，不会被空桩盖住），
+     并对 execute 列表真 Invoke 后再 dump。内部类构造失败会 allocateInstance 再调
+     实例方法（壳在 Invoke 入口解密即可）。无 pathList 且不委托父加载器的自定义
+     ClassLoader 挂不上桩。
+
+  java.lang.ClassValue 等 boot 类型不能当应用桩。ULE / JNI 缺 so 也不是这一类。
+
+Frida（D:\\test\\CYRUS-STUDIO-frida_fart）：
+  不要做成 FART 的编译依赖。ROM overlay 不引用 Frida。
+  职责是精细调用 / 补动态 ClassLoader，解决不了缺 class_def。
+  若要一个仓库里能找到脚本，可把该目录做成 FART/frida 可选 submodule（git submodule add），
+  不 checkout 也不影响刷机脱壳。上游本身就是两个并列仓库。
+
 
 示例（精确控制）：
 
@@ -124,11 +152,12 @@ FART ROM 能补的：
             （art/runtime/class_linker.cc，tag android-13.0.0_r4）。
             不要 overlay class_linker.cc。钩子在 ArtMethod::Invoke 退出
             + Execute 退出 + 巡检后 nativeDumpClassInitializer。
-  广告 40   ROM 补不出。PRE 同样没有 SwipeRefreshLayout / UMP / OAID
-            接口的 class_def。从 PRE 写回 CodeItem。
-  sha_mismatch  不是打孔，不要整包用 PRE 覆盖（id 对不齐会 VerifyError）。
+  广告 40   ROM 补不出。POST/PRE 都没有 SwipeRefreshLayout / UMP / OAID
+            接口的 class_def，巡检 DefineClass 失败，ins 写不到。
+            方法体只能来自加固包运行时 dump，禁止从 PRE 抄 CodeItem。
+  sha_mismatch  不是打孔。PRE 只做对照，禁止整包/按方法用 PRE 覆盖。
 
-刷机后看 dump_stats.clinit_written >> 0。剩下 zeroed 从 PRE 写回。
+刷机后看 dump_stats.clinit_written >> 0。广告洞保持 dump 原样，不要从 PRE 填。
 
 AOSP 13 基线（缺文件时拉单文件再叠本目录补丁）：
   https://android.googlesource.com/platform/art/+/refs/tags/android-13.0.0_r4/runtime/art_method.cc
@@ -203,10 +232,13 @@ android-13.0.0_r4：<clinit> CodeItem 捕获（本地补丁）
   lunch aosp_redfin-userdebug
   m
 
-  本轮同时改了 ART（libart / ART apex）和 framework / libcore。
+  本轮 clinit 同时改了 ART（libart / ART apex）和 framework / libcore。
   只推 framework.jar 不够：没有 Invoke 退出钩子，巡检跑了 <clinit> 也写不进 ins.bin。
   增量可先 m libart 再 m framework，AOSP 13 的 ART 在 com.android.art apex 里，
   整机 m + 刷 boot/system/apex 更稳。不要改 current.txt，dump ROM 用关检查即可。
+
+  缺父类/接口空桩（Cyrus / CyrusDump / ActivityThread）只改 framework，
+  已有 clinit ROM 上只需 m framework 再刷 system，不必为它重编 ART。
 
 刷机后验证
   # 清旧产物再跑目标包（不必再挂 Frida）
@@ -216,15 +248,16 @@ android-13.0.0_r4：<clinit> CodeItem 捕获（本地补丁）
   cat /data/data/<包名>/cyrus_*/inspect_stats.txt
   grep "<clinit>" /data/data/<包名>/cyrus_*/*_ins_*.bin
   # dump_stats.clinit_written 应明显大于 0；记录里 code_item_len 应大于 18
-  # 广告 CNFE（Failed resolution of 父类/接口）仍会出现，从 PRE 写回那 40 个
+  # 缺父类/接口的 CNFE：用 tools/link_stubs.py 生成桩后再跑第二轮（见上文）
   # 仍为 0 说明 dump 没打开、类没初始化、或仍是占位体
 
 限制
   - 只捕获实际跑过的 <clinit>（forName 初始化 / 业务路径会跑；已初始化的类不会再跑）
   - 解密若发生在 Invoke 返回之后（ClassLinker 尾部），退出 dump 仍空，再钩 InitializeClass
   - init_classes=true 会执行类静态初始化，个别类 ExceptionInInitializerError 记入 inspect_fail
-  - 广告/可选 SDK：父类或接口在 PRE 和 dump 里都只有 type_id 时，
-    AOSP DefineClass 失败。方法体从 PRE 写回，不要改 ART 强行 define。
+  - 缺父类/接口 class_def：用 link_stubs.py 空桩 + 真调用第二轮，不要改 ART
+    强行 define，也不要从 PRE 抄方法体。boot 缺类型 / ULE 不在此解法内。
+    无 pathList 且不委托父加载器的自定义 ClassLoader 挂不上桩 DEX。
   - traceDexExecution 仍保留但 Execute 不再调用（死代码，可留可删）
 
 
