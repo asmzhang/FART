@@ -38,20 +38,28 @@ link_stubs	/data/local/tmp/fart_link_stubs.dex	缺父类/接口时预挂的空�
 execute_file	/data/local/tmp/fart_link_stubs.execute.txt	真调用再 dump 的类名列表（默认与 link_stubs 同名 .execute.txt）
 execute	com.foo.*	同上，通配符；dumpMethodCode 不执行，占位体要靠真 Invoke 解开
 
-缺父类/接口（一类问题，通用，不按 SDK/广告包名，不手写样本桩，不读 PRE）：
+缺父类/接口/签名类型（一类问题，通用，不按 SDK/广告包名，不手写样本桩，不读 PRE）：
   加固包 DEX 里 class_def 引用了只有 type_id、没有 class_def 的 super/iface 时，
-  ART DefineClass 失败，壳不会解密这些方法。Frida dumpMethodCode 同样不执行。
-  不要从原包抄 CodeItem。
+  ART DefineClass 失败，壳不会解密这些方法。方法参数/返回/字段同样缺 class_def 时，
+  类能 DefineClass，但 getParameterTypes / 真 Invoke 进不去，占位体仍在。
+  Frida dumpMethodCode 同样不执行。不要从原包抄 CodeItem。
 
   两轮（换包只重跑生成器，不必改 ROM Java）：
   1) 先按普通 dump 跑一轮，得到 cyrus_*/*_dex_file.dex（缺类型的类仍是打孔）。
   2) 从这份 dump 生成空桩（可带 --fail inspect_fail.txt，目录里有会自动读）：
        python tools/link_stubs.py --dex-dir <cyrus dump 目录> --out fart_link_stubs.dex --push
      默认推到 /data/local/tmp/fart_link_stubs.dex 与同名 .execute.txt。
+     桩覆盖缺的 super/iface **以及** 方法签名/字段类型。
+     桩类补 field_id / method_id 上的空字段与空静态方法（inspect 里
+     NoSuchMethodError / sget 才过得去）。javac 需要的未 stub 假 outer
+     在 d8 之后从桩 DEX 删掉 class_def，避免盖住真实类或可选依赖。
+     execute 列表 = 缺父类子类 ∪ 回写 ins 之后仍打孔的类（非 1 条 return-void），
+     并与已有 .execute.txt 取并集。
   3) 清 cyrus_* 再开一次包。dump=true 时 ROM 在 Application.onCreate 之前把桩 DEX
      **接在** 应用 ClassLoader 后面（已有 class_def 仍走 dump/壳，不会被空桩盖住），
      并对 execute 列表真 Invoke 后再 dump。内部类构造失败会 allocateInstance 再调
-     实例方法（壳在 Invoke 入口解密即可）。无 pathList 且不委托父加载器的自定义
+     实例方法（壳在 Invoke 入口解密即可）。参数缺类型时用空桩实例 / Proxy / ""，
+     不用 null（部分壳见 null 不解密）。无 pathList 且不委托父加载器的自定义
      ClassLoader 挂不上桩。
 
   java.lang.ClassValue 等 boot 类型不能当应用桩。ULE / JNI 缺 so 也不是这一类。
@@ -255,8 +263,9 @@ android-13.0.0_r4：<clinit> CodeItem 捕获（本地补丁）
   - 只捕获实际跑过的 <clinit>（forName 初始化 / 业务路径会跑；已初始化的类不会再跑）
   - 解密若发生在 Invoke 返回之后（ClassLinker 尾部），退出 dump 仍空，再钩 InitializeClass
   - init_classes=true 会执行类静态初始化，个别类 ExceptionInInitializerError 记入 inspect_fail
-  - 缺父类/接口 class_def：用 link_stubs.py 空桩 + 真调用第二轮，不要改 ART
-    强行 define，也不要从 PRE 抄方法体。boot 缺类型 / ULE 不在此解法内。
+  - 缺 class_def：用 link_stubs.py 空桩 + 真调用第二轮，不要改 ART
+    强行 define，也不要从 PRE 抄方法体。桩覆盖 super/iface 和签名/字段类型；
+    execute 列表含回写后仍打孔的类。boot 缺类型 / ULE 不在此解法内。
     无 pathList 且不委托父加载器的自定义 ClassLoader 挂不上桩 DEX。
   - traceDexExecution 仍保留但 Execute 不再调用（死代码，可留可删）
 

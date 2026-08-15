@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Generic missing-type stubs for FART dump (no PRE APK).
 
-Problem class: dump DEX has class_def rows whose superclass / interfaces are
-only type_ids (no class_def, not a boot type). ART DefineClass fails, so the
-packer never decrypts those CodeItems. Ads / UMP / OAID / ArcherBridge are
-instances of this class, not special cases.
+Problem class: dump DEX has class_def rows whose superclass / interfaces /
+method proto / field types are only type_ids (no class_def, not a boot type).
+Missing super/iface → ART DefineClass fails. Missing signature types →
+getParameterTypes / invoke never enters, packer keeps the placeholder.
+Ads / UMP / OAID / ArcherBridge / FormError / IdSupplier are instances.
 
-This tool only reads packed-app dump DEX (and optional inspect_fail). It emits
-empty class/interface stubs plus an execute list of children that needed them.
+This tool only reads packed-app dump DEX (and optional inspect_fail / ins.bin).
+It emits empty class/interface stubs plus an execute list: dependents of
+missing supers, and classes whose CodeItems still look packed after ins merge.
 
     python tools/link_stubs.py --dex-dir DIR --out fart_link_stubs.dex
     python tools/link_stubs.py --dex-dir DIR --out fart_link_stubs.dex --push
@@ -16,6 +18,7 @@ empty class/interface stubs plus an execute list of children that needed them.
 from __future__ import annotations
 
 import argparse
+import base64
 import os
 import re
 import shutil
@@ -28,7 +31,6 @@ from pathlib import Path
 
 BOOT_PREFIXES = (
     "Ljava/",
-    "Ljavax/",
     "Landroid/",
     "Ldalvik/",
     "Llibcore/",
@@ -40,6 +42,17 @@ BOOT_PREFIXES = (
     "Lorg/xml/",
 )
 
+# Android boot has a few javax.* packages. The rest (servlet, money, JAX-RS, …)
+# are optional app deps and must be stubbed when dump DEX references them.
+JAVAX_BOOT_PREFIXES = (
+    "Ljavax/crypto/",
+    "Ljavax/net/",
+    "Ljavax/security/",
+    "Ljavax/xml/",
+    "Ljavax/sql/",
+    "Ljavax/microedition/",
+)
+
 # androidx / material are app types even though they look like platform.
 NOT_BOOT_PREFIXES = (
     "Landroidx/",
@@ -47,6 +60,17 @@ NOT_BOOT_PREFIXES = (
 )
 
 FAILED_RES = re.compile(r"Failed resolution of:\s*(L[^;\s]+;)")
+NOSUCH_METHOD = re.compile(
+    r"No static method (?P<name>[\w$]+)\((?P<args>[^)]*)\)(?P<ret>\S*) in class (?P<cls>L[^;]+;)"
+)
+INS_RE = re.compile(
+    rb"\{name:(?P<name>.*?),"
+    rb"method_idx:(?P<mid>\d+),"
+    rb"offset:(?P<off>\d+),"
+    rb"code_item_len:(?P<clen>\d+),"
+    rb".*?"
+    rb"ins:(?P<ins>[A-Za-z0-9+/=]+)\};"
+)
 PRIM = {
     "V": "void",
     "Z": "boolean",
@@ -57,6 +81,27 @@ PRIM = {
     "J": "long",
     "F": "float",
     "D": "double",
+}
+
+SKIP_STUB_METHODS = {
+    "getMessage",
+    "getLocalizedMessage",
+    "toString",
+    "hashCode",
+    "equals",
+    "wait",
+    "notify",
+    "notifyAll",
+    "getClass",
+    "finalize",
+    "clone",
+    "getCause",
+    "getStackTrace",
+    "printStackTrace",
+    "fillInStackTrace",
+    "initCause",
+    "addSuppressed",
+    "getSuppressed",
 }
 
 
@@ -83,7 +128,45 @@ def is_boot(desc: str) -> bool:
         return True
     if desc.startswith(NOT_BOOT_PREFIXES):
         return False
+    if desc.startswith("Ljavax/"):
+        return desc.startswith(JAVAX_BOOT_PREFIXES)
     return desc.startswith(BOOT_PREFIXES)
+
+
+def leaf_type(desc: str) -> str:
+    while desc.startswith("["):
+        desc = desc[1:]
+    return desc
+
+
+def close_signature_stubs(
+    stub_kind: dict[str, str],
+    stub_fields: dict[str, list[tuple[str, str]]],
+    stub_methods: dict[str, list[tuple[str, str, tuple[str, ...]]]],
+    defined: set[str],
+) -> int:
+    """Stub every L-type that appears on a stub field/method so javac can compile."""
+    added = 0
+    changed = True
+    while changed:
+        changed = False
+        types: set[str] = set()
+        for items in stub_fields.values():
+            for _name, fty in items:
+                types.add(leaf_type(fty))
+        for items in stub_methods.values():
+            for _name, ret, params in items:
+                types.add(leaf_type(ret))
+                types.update(leaf_type(p) for p in params)
+        for desc in types:
+            if not desc or desc[0] != "L":
+                continue
+            if desc in defined or is_boot(desc) or desc in stub_kind:
+                continue
+            stub_kind[desc] = "interface" if iface_name_hint(desc) else "class"
+            added += 1
+            changed = True
+    return added
 
 
 def dotted_to_desc(name: str) -> str:
@@ -109,6 +192,52 @@ def java_type(desc: str) -> str:
     return desc
 
 
+def java_default_stmt(desc: str) -> str:
+    if desc == "V":
+        return ""
+    if desc == "Z":
+        return "return false;"
+    if desc in ("B", "S", "C", "I"):
+        return "return 0;"
+    if desc == "J":
+        return "return 0L;"
+    if desc == "F":
+        return "return 0f;"
+    if desc == "D":
+        return "return 0d;"
+    return "return null;"
+
+
+def split_dalvik_params(s: str) -> list[str]:
+    out: list[str] = []
+    i = 0
+    n = len(s)
+    while i < n:
+        if s[i] == "L":
+            j = s.find(";", i)
+            if j < 0:
+                break
+            out.append(s[i : j + 1])
+            i = j + 1
+        elif s[i] == "[":
+            k = i
+            while k < n and s[k] == "[":
+                k += 1
+            if k < n and s[k] == "L":
+                j = s.find(";", k)
+                if j < 0:
+                    break
+                out.append(s[i : j + 1])
+                i = j + 1
+            else:
+                out.append(s[i : k + 1])
+                i = k + 1
+        else:
+            out.append(s[i])
+            i += 1
+    return out
+
+
 def is_java_ident(name: str) -> bool:
     return bool(name) and name.isidentifier()
 
@@ -125,6 +254,7 @@ class DexLite:
             read_mutf8(raw, struct.unpack_from("<I", raw, ss_off + i * 4)[0])
             for i in range(ss_sz)
         ]
+        self.strings = strings
         self.types = [
             strings[struct.unpack_from("<I", raw, t_off + i * 4)[0]] for i in range(t_sz)
         ]
@@ -147,6 +277,10 @@ class DexLite:
                 continue
             _ret, params = protos[proto_idx]
             self.inits.append((self.types[class_idx], tuple(params)))
+        self.protos = protos
+        self._p_sz, self._p_off = p_sz, p_off
+        self._f_sz, self._f_off = struct.unpack_from("<II", raw, 0x50)
+        self._m_sz, self._m_off = m_sz, m_off
 
     def defined(self) -> set[str]:
         out = set()
@@ -173,19 +307,155 @@ class DexLite:
             rows.append((cn, sup, ifaces))
         return rows
 
+    def proto_and_field_types(self) -> tuple[set[str], set[str]]:
+        protos: set[str] = set()
+        for i in range(self._m_sz):
+            _c, proto_idx, _n = struct.unpack_from("<HHI", self.data, self._m_off + i * 8)
+            _shorty, ret_idx, params_off = struct.unpack_from(
+                "<III", self.data, self._p_off + proto_idx * 12
+            )
+            protos.add(self.types[ret_idx])
+            if params_off:
+                n = struct.unpack_from("<I", self.data, params_off)[0]
+                for j in range(n):
+                    ti = struct.unpack_from("<H", self.data, params_off + 4 + j * 2)[0]
+                    protos.add(self.types[ti])
+        fields: set[str] = set()
+        for i in range(self._f_sz):
+            _c, t, _n = struct.unpack_from("<HHI", self.data, self._f_off + i * 8)
+            fields.add(self.types[t])
+        return protos, fields
+
+    def fields_owned(self) -> dict[str, list[tuple[str, str]]]:
+        out: dict[str, list[tuple[str, str]]] = {}
+        for i in range(self._f_sz):
+            c, t, ni = struct.unpack_from("<HHI", self.data, self._f_off + i * 8)
+            owner = self.types[c]
+            item = (self.strings[ni], self.types[t])
+            bucket = out.setdefault(owner, [])
+            if item not in bucket:
+                bucket.append(item)
+        return out
+
+    def methods_owned(self) -> dict[str, list[tuple[str, str, tuple[str, ...]]]]:
+        out: dict[str, list[tuple[str, str, tuple[str, ...]]]] = {}
+        for i in range(self._m_sz):
+            c, p, ni = struct.unpack_from("<HHI", self.data, self._m_off + i * 8)
+            name = self.strings[ni]
+            if name in ("<init>", "<clinit>"):
+                continue
+            ret, params = self.protos[p]
+            item = (name, ret, tuple(params))
+            bucket = out.setdefault(self.types[c], [])
+            if item not in bucket:
+                bucket.append(item)
+        return out
+
+    def packed_owners(self) -> set[str]:
+        out: set[str] = set()
+        raw = self.data
+        n = len(raw)
+        for ci in range(self.class_defs_size):
+            base = self.class_defs_off + ci * 32
+            class_idx, _a, _s, _i, _src, _ann, class_data, _sv = struct.unpack_from(
+                "<IIIIIIII", raw, base
+            )
+            if not class_data:
+                continue
+            off = class_data
+            try:
+                sf, off = uleb128(raw, off)
+                iff, off = uleb128(raw, off)
+                dm, off = uleb128(raw, off)
+                vm, off = uleb128(raw, off)
+                for _ in range(sf + iff):
+                    _, off = uleb128(raw, off)
+                    _, off = uleb128(raw, off)
+                packed = False
+                for count in (dm, vm):
+                    for _ in range(count):
+                        _, off = uleb128(raw, off)
+                        _, off = uleb128(raw, off)
+                        code_off, off = uleb128(raw, off)
+                        if looks_packed_code(raw, code_off, n):
+                            packed = True
+                if packed:
+                    out.add(self.types[class_idx])
+            except Exception:
+                continue
+        return out
+
+
+def looks_packed_code(data: bytes | bytearray, off: int, n: int) -> bool:
+    """Non-trivial Virbox-style punch: keep size, fill nops/zeros. Not 1-insn return-void."""
+    if off <= 0 or off + 16 > n:
+        return False
+    insns = struct.unpack_from("<I", data, off + 12)[0]
+    if insns < 4:
+        return False
+    end = off + 16 + insns * 2
+    if end > n:
+        return False
+    code = bytes(data[off + 16 : end])
+    if code[:2] == b"\x0e\x00" and code[2:].count(0) >= len(code) - 2:
+        return True
+    if code[:4] in (b"\x12\x00\x11\x00", b"\x12\x00\x0f\x00") and code[4:].count(0) >= len(code) - 4:
+        return True
+    return code.count(0) >= max(4, int(len(code) * 0.75))
+
+
+def apply_ins(dex: bytearray, blob: bytes) -> int:
+    wrote = 0
+    for m in INS_RE.finditer(blob):
+        off = int(m.group("off"))
+        clen = int(m.group("clen"))
+        raw = base64.b64decode(m.group("ins"))
+        if len(raw) != clen or off < 0 or off + clen > len(dex):
+            continue
+        dex[off : off + clen] = raw
+        wrote += 1
+    return wrote
+
+
+def packed_from_dex_dir(dex_dir: Path, dex_paths: list[Path]) -> set[str]:
+    """Classes whose CodeItems still look packed after merging ins.bin (post-inspect view)."""
+    out: set[str] = set()
+    any_ins = False
+    for p in dex_paths:
+        prefix = p.name.split("_")[0]
+        blobs = sorted(
+            dex_dir.glob(f"{prefix}_ins_*.bin"),
+            key=lambda x: x.stat().st_size,
+            reverse=True,
+        )
+        if not blobs:
+            continue
+        any_ins = True
+        raw = bytearray(p.read_bytes())
+        for ins in blobs:
+            apply_ins(raw, ins.read_bytes())
+        for desc in DexLite(bytes(raw)).packed_owners():
+            if not is_boot(desc):
+                out.add(desc_to_dotted(desc))
+    return out if any_ins else set()
+
 
 def list_dump_dex(dex_dir: Path) -> list[Path]:
     files = sorted(
         p
         for p in dex_dir.glob("*_dex_file.dex")
-        if "fix" not in p.name.lower() and "stub" not in p.name.lower()
+        if "fix" not in p.name.lower()
+        and "stub" not in p.name.lower()
+        and p.stat().st_size >= 65536
     )
     if files:
         return files
     return [
         p
         for p in sorted(dex_dir.glob("*.dex"))
-        if "fix" not in p.name.lower() and "stub" not in p.name.lower()
+        if "fix" not in p.name.lower()
+        and "stub" not in p.name.lower()
+        and p.stat().st_size >= 65536
     ]
 
 
@@ -207,6 +477,10 @@ def pick_java_super(desc: str, kind: str) -> str:
     if kind == "interface":
         return "java.lang.Object"
     n = desc.lower()
+    if n.endswith("error;"):
+        return "java.lang.Error"
+    if n.endswith("exception;"):
+        return "java.lang.Exception"
     if "drawable" in n:
         return "android.graphics.drawable.Drawable"
     if any(s in n for s in ("view", "layout", "widget", "recycler")):
@@ -225,6 +499,7 @@ def iface_name_hint(desc: str) -> bool:
             "verifier",
             "bridge",
             "interface",
+            "supplier",
         )
     )
 
@@ -235,10 +510,15 @@ def scan(
     defined: set[str] = set()
     rows: list[tuple[str, str | None, list[str]]] = []
     inits: dict[str, list[tuple[str, ...]]] = {}
+    proto_types: set[str] = set()
+    field_types: set[str] = set()
     for p in dex_paths:
         dex = DexLite(p.read_bytes())
         defined |= dex.defined()
         rows.extend(dex.rows())
+        ptypes, ftypes = dex.proto_and_field_types()
+        proto_types |= ptypes
+        field_types |= ftypes
         for owner, params in dex.inits:
             bucket = inits.setdefault(owner, [])
             if params not in bucket:
@@ -278,6 +558,12 @@ def scan(
                 child_set.add(dotted)
                 child_desc.add(cn)
                 changed = True
+
+    for desc in proto_types | field_types:
+        if not desc or desc[0] != "L" or desc in defined or is_boot(desc):
+            continue
+        if desc not in stub_kind:
+            stub_kind[desc] = "class"
     return stub_kind, sorted(child_set), inits, defined
 
 
@@ -286,13 +572,30 @@ def merge_fail(
     stub_kind: dict[str, str],
     children: list[str],
     defined: set[str],
+    stub_methods: dict[str, list[tuple[str, str, tuple[str, ...]]]] | None = None,
 ) -> None:
     child_set = set(children)
     text = fail_path.read_text(encoding="utf-8", errors="replace")
     for line in text.splitlines():
-        if "UnsatisfiedLinkError" in line or "NoSuchFieldError" in line:
+        if "UnsatisfiedLinkError" in line:
             continue
         if "ExceptionInInitializerError" in line:
+            continue
+        if stub_methods is not None:
+            for m in NOSUCH_METHOD.finditer(line):
+                desc = m.group("cls")
+                if desc in defined or is_boot(desc):
+                    continue
+                if desc not in stub_kind:
+                    stub_kind[desc] = "class"
+                name = m.group("name")
+                ret = m.group("ret") or "V"
+                params = tuple(split_dalvik_params(m.group("args") or ""))
+                bucket = stub_methods.setdefault(desc, [])
+                item = (name, ret, params)
+                if item not in bucket:
+                    bucket.append(item)
+        if "NoSuchFieldError" in line:
             continue
         added_stub = False
         for m in FAILED_RES.finditer(line):
@@ -312,8 +615,35 @@ def merge_fail(
     children[:] = sorted(child_set)
 
 
+def collect_stub_members(
+    dex_paths: list[Path],
+    stub_kind: dict[str, str],
+) -> tuple[dict[str, list[tuple[str, str]]], dict[str, list[tuple[str, str, tuple[str, ...]]]]]:
+    fields: dict[str, list[tuple[str, str]]] = {}
+    methods: dict[str, list[tuple[str, str, tuple[str, ...]]]] = {}
+    for path in dex_paths:
+        dex = DexLite(path.read_bytes())
+        for owner, items in dex.fields_owned().items():
+            if owner not in stub_kind:
+                continue
+            bucket = fields.setdefault(owner, [])
+            for item in items:
+                if item not in bucket:
+                    bucket.append(item)
+        for owner, items in dex.methods_owned().items():
+            if owner not in stub_kind:
+                continue
+            bucket = methods.setdefault(owner, [])
+            for item in items:
+                if item not in bucket:
+                    bucket.append(item)
+    return fields, methods
+
+
 def super_call(java_super: str, params: tuple[str, ...], names: list[str]) -> str:
     if java_super == "java.lang.Object" or java_super == "android.graphics.drawable.Drawable":
+        return "super();"
+    if java_super in ("java.lang.Exception", "java.lang.Error"):
         return "super();"
     if java_super in ("android.view.ViewGroup", "android.view.View"):
         ctx = [i for i, p in enumerate(params) if p == "Landroid/content/Context;"]
@@ -413,6 +743,8 @@ def emit_node(
     inits: dict[str, list[tuple[str, ...]]],
     indent: int,
     lines: list[str],
+    stub_fields: dict[str, list[tuple[str, str]]] | None = None,
+    stub_methods: dict[str, list[tuple[str, str, tuple[str, ...]]]] | None = None,
 ) -> None:
     if not is_java_ident(node.name):
         lines.append("    " * indent + f"// skip non-identifier {node.desc}")
@@ -432,8 +764,24 @@ def emit_node(
     if kind != "interface":
         lines.extend(emit_ctors(node.name, java_super, inits.get(node.desc, []), inner))
         lines.extend(emit_abstracts(java_super, inner))
+        seen_fields: set[str] = set()
+        for fname, fty in (stub_fields or {}).get(node.desc, []):
+            if fname in seen_fields or not is_java_ident(fname):
+                continue
+            seen_fields.add(fname)
+            lines.append(f"{inner}public static {java_type(fty)} {fname};")
+        seen_m: set[tuple[str, tuple[str, ...]]] = set()
+        for mname, ret, params in (stub_methods or {}).get(node.desc, []):
+            key = (mname, params)
+            if key in seen_m or not is_java_ident(mname) or mname in SKIP_STUB_METHODS:
+                continue
+            seen_m.add(key)
+            names = [f"a{i}" for i in range(len(params))]
+            args = ", ".join(f"{java_type(p)} {n}" for p, n in zip(params, names))
+            body = java_default_stmt(ret)
+            lines.append(f"{inner}public static {java_type(ret)} {mname}({args}) {{ {body} }}")
     for child in sorted(node.children.values(), key=lambda n: n.name):
-        emit_node(child, stub_kind, inits, indent + 1, lines)
+        emit_node(child, stub_kind, inits, indent + 1, lines, stub_fields, stub_methods)
     lines.append(f"{sp}}}")
 
 
@@ -441,6 +789,8 @@ def emit_java(
     stub_kind: dict[str, str],
     inits: dict[str, list[tuple[str, ...]]],
     src_dir: Path,
+    stub_fields: dict[str, list[tuple[str, str]]] | None = None,
+    stub_methods: dict[str, list[tuple[str, str, tuple[str, ...]]]] | None = None,
 ) -> None:
     trees = build_trees(stub_kind)
     for top_desc, tree in trees.items():
@@ -452,10 +802,135 @@ def emit_java(
             lines.append(f"package {pkg};")
             lines.append("")
         lines.append("/** Auto-generated FART link stub. Empty type so packed DEX can DefineClass. */")
-        emit_node(tree, stub_kind, inits, 0, lines)
+        emit_node(tree, stub_kind, inits, 0, lines, stub_fields, stub_methods)
         out = src_dir.joinpath(*pkg.split("."), f"{tree.name}.java") if pkg else src_dir / f"{tree.name}.java"
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def unstubbed_container_descs(stub_kind: dict[str, str]) -> set[str]:
+    """Outer/intermediate Java containers that javac emits but must not be loadable stubs."""
+    drop: set[str] = set()
+
+    def walk(node: NestNode) -> None:
+        if not node.stubbed:
+            drop.add(node.desc)
+        for child in node.children.values():
+            walk(child)
+
+    for tree in build_trees(stub_kind).values():
+        walk(tree)
+    return drop
+
+
+def _class_data_len(data: bytes | bytearray, off: int) -> int:
+    start = off
+    sf, off = uleb128(data, off)
+    iff, off = uleb128(data, off)
+    dm, off = uleb128(data, off)
+    vm, off = uleb128(data, off)
+    for _ in range(sf + iff):
+        _, off = uleb128(data, off)
+        _, off = uleb128(data, off)
+    for _ in range(dm + vm):
+        _, off = uleb128(data, off)
+        _, off = uleb128(data, off)
+        _, off = uleb128(data, off)
+    return off - start
+
+
+def _drop_class_defs(data: bytearray, drop_descs: set[str]) -> int:
+    if not drop_descs or data[:4] != b"dex\n":
+        return 0
+    ss_sz, ss_off = struct.unpack_from("<II", data, 0x38)
+    strings = []
+    for i in range(ss_sz):
+        off = struct.unpack_from("<I", data, ss_off + i * 4)[0]
+        n, payload = uleb128(data, off)
+        del n
+        end = data.index(0, payload)
+        strings.append(bytes(data[payload:end]).decode("utf-8", "replace"))
+    t_sz, t_off = struct.unpack_from("<II", data, 0x40)
+    types = [strings[struct.unpack_from("<I", data, t_off + i * 4)[0]] for i in range(t_sz)]
+    drop_idx = {i for i, t in enumerate(types) if t in drop_descs}
+    if not drop_idx:
+        return 0
+    c_sz, c_off = struct.unpack_from("<II", data, 0x60)
+    kept_recs: list[bytearray] = []
+    kept_blobs: list[bytes] = []
+    data_lo: int | None = None
+    data_hi: int | None = None
+    for i in range(c_sz):
+        rec = bytearray(data[c_off + i * 32 : c_off + (i + 1) * 32])
+        class_idx = struct.unpack_from("<I", rec, 0)[0]
+        cdata = struct.unpack_from("<I", rec, 24)[0]
+        blob = b""
+        if cdata:
+            n = _class_data_len(data, cdata)
+            blob = bytes(data[cdata : cdata + n])
+            data_lo = cdata if data_lo is None else min(data_lo, cdata)
+            data_hi = cdata + n if data_hi is None else max(data_hi, cdata + n)
+        if class_idx in drop_idx:
+            continue
+        kept_recs.append(rec)
+        kept_blobs.append(blob)
+    dropped = c_sz - len(kept_recs)
+    if dropped == 0:
+        return 0
+    map_off = struct.unpack_from("<I", data, 0x34)[0]
+    nmap = struct.unpack_from("<I", data, map_off)[0]
+    cd_start = data_lo
+    for i in range(nmap):
+        t, _u, _sz, off = struct.unpack_from("<HHII", data, map_off + 4 + i * 12)
+        if t == 0x2000:
+            cd_start = off
+            break
+    if cd_start is None:
+        cd_start = 0
+    cur = cd_start
+    nonempty = 0
+    for rec, blob in zip(kept_recs, kept_blobs):
+        if blob:
+            data[cur : cur + len(blob)] = blob
+            struct.pack_into("<I", rec, 24, cur)
+            cur += len(blob)
+            nonempty += 1
+        else:
+            struct.pack_into("<I", rec, 24, 0)
+    if data_hi is not None and cur < data_hi:
+        data[cur:data_hi] = b"\x00" * (data_hi - cur)
+    for i, rec in enumerate(kept_recs):
+        data[c_off + i * 32 : c_off + (i + 1) * 32] = rec
+    tail = c_off + len(kept_recs) * 32
+    old_end = c_off + c_sz * 32
+    if old_end > tail:
+        data[tail:old_end] = b"\x00" * (old_end - tail)
+    struct.pack_into("<I", data, 0x60, len(kept_recs))
+    for i in range(nmap):
+        base = map_off + 4 + i * 12
+        t, u, sz, off = struct.unpack_from("<HHII", data, base)
+        if t == 0x0006:
+            struct.pack_into("<HHII", data, base, t, u, len(kept_recs), off)
+        elif t == 0x2000:
+            struct.pack_into("<HHII", data, base, t, u, nonempty, cd_start)
+    import hashlib
+    import zlib
+
+    struct.pack_into("<I", data, 32, len(data))
+    data[12:32] = hashlib.sha1(data[32:]).digest()
+    struct.pack_into("<I", data, 8, zlib.adler32(data[12:]) & 0xFFFFFFFF)
+    return dropped
+
+
+def strip_unstubbed_outers(dex_path: Path, stub_kind: dict[str, str]) -> int:
+    drop = unstubbed_container_descs(stub_kind)
+    if not drop:
+        return 0
+    data = bytearray(dex_path.read_bytes())
+    n = _drop_class_defs(data, drop)
+    if n:
+        dex_path.write_bytes(data)
+    return n
 
 
 def find_sdk() -> tuple[Path, Path]:
@@ -501,13 +976,34 @@ def compile_dex(src_dir: Path, out_dex: Path) -> None:
     ] + [str(p) for p in java_files]
     subprocess.check_call(cmd)
     class_files = list(classes.rglob("*.class"))
-    d8_cmd = [str(d8), "--release", "--min-api", "24", "--output", str(out_dex.parent), "--lib", str(android_jar)]
-    d8_cmd += [str(p) for p in class_files]
+    if not class_files:
+        raise SystemExit("javac produced no class files")
+    jar = shutil.which("jar")
+    if not jar:
+        raise SystemExit("jar not on PATH")
+    stub_jar = out_dex.parent / "_stub_classes.jar"
+    subprocess.check_call([jar, "cf", str(stub_jar), "-C", str(classes), "."])
+    d8_out = out_dex.parent / "_stub_d8"
+    if d8_out.exists():
+        shutil.rmtree(d8_out)
+    d8_out.mkdir(parents=True)
+    d8_cmd = [
+        str(d8),
+        "--release",
+        "--min-api",
+        "24",
+        "--output",
+        str(d8_out),
+        "--lib",
+        str(android_jar),
+        str(stub_jar),
+    ]
     subprocess.check_call(d8_cmd)
-    produced = out_dex.parent / "classes.dex"
-    if produced.resolve() != out_dex.resolve():
-        out_dex.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(produced, out_dex)
+    produced = d8_out / "classes.dex"
+    if not produced.is_file():
+        raise SystemExit(f"d8 did not write {produced}")
+    out_dex.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(produced, out_dex)
 
 
 def adb_push(local: Path, remote: str, serial: str | None) -> None:
@@ -544,21 +1040,64 @@ def main() -> int:
         raise SystemExit("no dex: pass --dex-dir and/or --apk")
 
     stub_kind, children, inits, defined = scan(dex_paths)
+    stub_methods: dict[str, list[tuple[str, str, tuple[str, ...]]]] = {}
     fail_path = args.fail
     if fail_path is None and args.dex_dir:
         cand = args.dex_dir / "inspect_fail.txt"
         if cand.is_file():
             fail_path = cand
     if fail_path and fail_path.is_file():
-        merge_fail(fail_path, stub_kind, children, defined)
+        merge_fail(fail_path, stub_kind, children, defined, stub_methods)
+    stub_fields, dex_methods = collect_stub_members(dex_paths, stub_kind)
+    for owner, items in dex_methods.items():
+        bucket = stub_methods.setdefault(owner, [])
+        for item in items:
+            if item not in bucket:
+                bucket.append(item)
+    closed = close_signature_stubs(stub_kind, stub_fields, stub_methods, defined)
+    if closed:
+        extra_fields, extra_methods = collect_stub_members(dex_paths, stub_kind)
+        for owner, items in extra_fields.items():
+            bucket = stub_fields.setdefault(owner, [])
+            for item in items:
+                if item not in bucket:
+                    bucket.append(item)
+        for owner, items in extra_methods.items():
+            bucket = stub_methods.setdefault(owner, [])
+            for item in items:
+                if item not in bucket:
+                    bucket.append(item)
+        close_signature_stubs(stub_kind, stub_fields, stub_methods, defined)
 
-    print("stubs", len(stub_kind), "execute_classes", len(children))
+    packed: set[str] = set()
+    if args.dex_dir:
+        packed = packed_from_dex_dir(args.dex_dir, dex_paths)
+    execute = set(children) | packed
+    exe = args.execute_out or args.out.with_suffix(".execute.txt")
+    if exe.is_file():
+        execute |= {ln.strip() for ln in exe.read_text(encoding="utf-8").splitlines() if ln.strip()}
+    execute_list = sorted(execute)
+
+    print(
+        "stubs",
+        len(stub_kind),
+        "execute_classes",
+        len(execute),
+        "from_missing_super",
+        len(children),
+        "from_packed",
+        len(packed),
+        "stub_fields",
+        sum(len(v) for v in stub_fields.values()),
+        "stub_methods",
+        sum(len(v) for v in stub_methods.values()),
+    )
     for desc, kind in sorted(stub_kind.items()):
         print(f"  {kind:9} {desc}")
     if not stub_kind:
-        print("no missing super/iface class_def; nothing to compile")
+        print("no missing super/iface/signature class_def; nothing to compile")
         exe = args.execute_out or args.out.with_suffix(".execute.txt")
-        exe.write_text("", encoding="utf-8")
+        exe.write_text("\n".join(execute_list) + ("\n" if execute_list else ""), encoding="utf-8")
         return 0
     if args.dry_run:
         return 0
@@ -567,10 +1106,12 @@ def main() -> int:
     if src.exists():
         shutil.rmtree(src)
     src.mkdir(parents=True)
-    emit_java(stub_kind, inits, src)
+    emit_java(stub_kind, inits, src, stub_fields, stub_methods)
     compile_dex(src, args.out)
-    exe = args.execute_out or args.out.with_suffix(".execute.txt")
-    exe.write_text("\n".join(children) + ("\n" if children else ""), encoding="utf-8")
+    stripped = strip_unstubbed_outers(args.out, stub_kind)
+    if stripped:
+        print("stripped_unstubbed_outers", stripped)
+    exe.write_text("\n".join(execute_list) + ("\n" if execute_list else ""), encoding="utf-8")
     print("wrote", args.out, "execute", exe)
     if args.push:
         adb_push(args.out, "/data/local/tmp/fart_link_stubs.dex", args.serial)

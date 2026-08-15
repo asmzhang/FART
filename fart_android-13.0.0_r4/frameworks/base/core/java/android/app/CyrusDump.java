@@ -9,8 +9,10 @@ import java.io.FileWriter;
 import java.lang.reflect.Array;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
+import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
+import java.lang.reflect.Proxy;
 import dalvik.system.PathClassLoader;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -783,6 +785,7 @@ final class CyrusDump {
     }
 
     private static void executeThenDump(Class<?> cls, Method dumpMethod) {
+        Log.e(TAG, "executeThenDump " + cls.getName());
         Object inst = tryAllocInstance(cls);
         try {
             Constructor<?>[] cons = cls.getDeclaredConstructors();
@@ -794,11 +797,13 @@ final class CyrusDump {
             }
         } catch (Throwable ignored) {
         }
+        Method[] methods = null;
         try {
-            Method[] methods = cls.getDeclaredMethods();
-            if (methods == null) {
-                return;
-            }
+            methods = cls.getDeclaredMethods();
+        } catch (Throwable t) {
+            Log.w(TAG, "executeThenDump getDeclaredMethods " + cls.getName() + " -> " + t);
+        }
+        if (methods != null) {
             for (int i = 0; i < methods.length; i++) {
                 Method m = methods[i];
                 try {
@@ -816,7 +821,6 @@ final class CyrusDump {
                 } catch (Throwable ignored) {
                 }
             }
-        } catch (Throwable ignored) {
         }
         if (sDumpClinit != null) {
             try {
@@ -834,7 +838,7 @@ final class CyrusDump {
     private static Object tryAllocInstance(Class<?> cls) {
         int mods = cls.getModifiers();
         if ((mods & Modifier.INTERFACE) != 0 || (mods & Modifier.ABSTRACT) != 0) {
-            return null;
+            return tryAllocateRaw(cls);
         }
         try {
             Constructor<?>[] cons = cls.getDeclaredConstructors();
@@ -850,6 +854,13 @@ final class CyrusDump {
                 }
             }
         } catch (Throwable ignored) {
+        }
+        return tryAllocateRaw(cls);
+    }
+
+    private static Object tryAllocateRaw(Class<?> cls) {
+        if (cls == null || cls.isPrimitive() || cls.isArray() || cls.isInterface()) {
+            return null;
         }
         try {
             Class<?> u = Class.forName("sun.misc.Unsafe");
@@ -873,35 +884,65 @@ final class CyrusDump {
         }
     }
 
+    private static Object dummyArg(Class<?> t) {
+        if (t == boolean.class) {
+            return Boolean.FALSE;
+        } else if (t == byte.class) {
+            return Byte.valueOf((byte) 0);
+        } else if (t == short.class) {
+            return Short.valueOf((short) 0);
+        } else if (t == int.class) {
+            return Integer.valueOf(0);
+        } else if (t == long.class) {
+            return Long.valueOf(0L);
+        } else if (t == float.class) {
+            return Float.valueOf(0f);
+        } else if (t == double.class) {
+            return Double.valueOf(0d);
+        } else if (t == char.class) {
+            return Character.valueOf((char) 0);
+        } else if (t == String.class) {
+            return "";
+        } else if (t == Class.class) {
+            return Object.class;
+        } else if (t.isArray()) {
+            return Array.newInstance(t.getComponentType(), 0);
+        } else if (t == android.content.Context.class) {
+            try {
+                return ActivityThread.currentApplication();
+            } catch (Throwable ignored) {
+                return null;
+            }
+        } else if (t.isInterface()) {
+            try {
+                ClassLoader cl = t.getClassLoader();
+                if (cl == null) {
+                    cl = CyrusDump.class.getClassLoader();
+                }
+                return Proxy.newProxyInstance(cl, new Class[] { t }, new InvocationHandler() {
+                    @Override
+                    public Object invoke(Object proxy, Method method, Object[] args) {
+                        Class<?> rt = method.getReturnType();
+                        if (rt == void.class || rt == Void.class) {
+                            return null;
+                        }
+                        if (rt.isPrimitive() || rt == String.class || rt.isArray()) {
+                            return dummyArg(rt);
+                        }
+                        return null;
+                    }
+                });
+            } catch (Throwable ignored) {
+                return null;
+            }
+        }
+        return tryAllocateRaw(t);
+    }
+
     private static Object[] defaultArgs(Class<?>[] types) {
         Object[] args = new Object[types.length];
         for (int i = 0; i < types.length; i++) {
-            Class<?> t = types[i];
-            if (t == boolean.class) {
-                args[i] = Boolean.FALSE;
-            } else if (t == byte.class) {
-                args[i] = Byte.valueOf((byte) 0);
-            } else if (t == short.class) {
-                args[i] = Short.valueOf((short) 0);
-            } else if (t == int.class) {
-                args[i] = Integer.valueOf(0);
-            } else if (t == long.class) {
-                args[i] = Long.valueOf(0L);
-            } else if (t == float.class) {
-                args[i] = Float.valueOf(0f);
-            } else if (t == double.class) {
-                args[i] = Double.valueOf(0d);
-            } else if (t == char.class) {
-                args[i] = Character.valueOf((char) 0);
-            } else if (t == android.content.Context.class) {
-                try {
-                    args[i] = ActivityThread.currentApplication();
-                } catch (Throwable ignored) {
-                    args[i] = null;
-                }
-            } else {
-                args[i] = null;
-            }
+            args[i] = dummyArg(types[i]);
         }
         return args;
     }
